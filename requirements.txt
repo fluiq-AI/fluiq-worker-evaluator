@@ -1,0 +1,14 @@
+anthropic>=0.34
+google-genai>=0.3
+pydantic>=2.6
+aiokafka>=0.10
+clickhouse-connect>=0.7
+python-dotenv>=1.0
+asyncpg>=0.29
+fluiq
+
+aiohttp
+# Used by the fluiq LLM-judge provider (jobs/.../judge.py _call_fluiq).
+# Previously present only transitively via sentence-transformers; now that the
+# security deps are gone (moved to fluiq-workers/security), pin it directly.
+requests>=2.31

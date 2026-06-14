@@ -1,0 +1,5 @@
+.env.development
+.env.production
+__pycache__
+.pytest_cache
+ecs-task-def.json
