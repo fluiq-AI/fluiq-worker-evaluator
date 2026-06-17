@@ -2,15 +2,18 @@ from typing import Any, List, Optional
 
 from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, _coerce_contexts
 from jobs.helper.judge import LLMJudge
+import datetime
 
 
 _CLAIMS_PROMPT = (
+    f"Today's date {datetime.datetime.now()}"
     "Extract every standalone factual claim from the ANSWER below. "
     "Return JSON: {{\"claims\": [\"claim 1\", \"claim 2\", ...]}}.\n\n"
     "ANSWER:\n{answer}"
 )
 
 _VERIFY_PROMPT = (
+    f"Today's date {datetime.datetime.now()}"
     "You are checking whether each CLAIM is supported by the REFERENCE. "
     "A claim is SUPPORTED only if the reference entails it; if the reference "
     "neither states nor implies it, mark it UNSUPPORTED. Speculation, added "
@@ -39,6 +42,7 @@ class HallucinationEvaluator(BaseEvaluator):
         if not reference_text:
             # No retrieval context — use LLM general knowledge to assess factual accuracy.
             data = self.judge.judge_json(
+                f"Today's date {datetime.datetime.now()}"
                 "Evaluate whether the ANSWER contains any factual errors or hallucinations "
                 "based on your general knowledge. Score 1.0 = fully accurate, 0.0 = completely "
                 "hallucinated or wrong.\n\n"

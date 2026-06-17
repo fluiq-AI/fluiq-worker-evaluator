@@ -13,6 +13,10 @@ KAFKA_SASL_MECHANISM=os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
 KAFKA_SASL_USERNAME=os.getenv("KAFKA_SASL_USERNAME")
 KAFKA_SASL_PASSWORD=os.getenv("KAFKA_SASL_PASSWORD")
 
+# Eval jobs carry the full trace event (can be multi-MB); raise the consumer
+# fetch ceiling above the ~1MB default to match the API/broker sizing.
+KAFKA_MAX_FETCH_BYTES = int(os.getenv("KAFKA_MAX_FETCH_BYTES", str(10 * 1024 * 1024)))
+
 
 def kafka_auth_kwargs() -> dict:
     """aiokafka security kwargs derived from env, shared by consumer + producer.
