@@ -258,8 +258,9 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
     api_key_prefix  = message.get("api_key_prefix")
     trace_id        = message.get("trace_id") or event.get("trace_id")
 
-    metrics    = eval_config.get("metrics") or ["hallucination", "relevance"]
-    thresholds = eval_config.get("thresholds") or {}
+    metrics       = eval_config.get("metrics") or ["hallucination", "relevance"]
+    thresholds    = eval_config.get("thresholds") or {}
+    custom_judges = eval_config.get("custom_judges") or {}
 
     question = _extract_llm_question(event)
     answer   = event.get("response") or event.get("output") or ""
@@ -297,6 +298,43 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
             logger.exception(
                 "[EVALUATOR] LLM eval failed metric=%s trace_id=%s", metric_name, trace_id,
             )
+
+    # Client-defined custom judges: resolve each slug to its saved judge template
+    # (org-scoped, kind='judge') and score the answer with it. Best-effort —
+    # missing template / PG down / judge error just skips that judge.
+    if custom_judges:
+        from db.postgres import postgres_client
+        from jobs.helper.custom_judge import CustomJudgeEvaluator
+
+        for slug, threshold in custom_judges.items():
+            template = await postgres_client.fetch_custom_judge(organization_id, slug)
+            if not template:
+                logger.info(
+                    "[EVALUATOR] custom judge %r unavailable for org=%s; skipping",
+                    slug, organization_id,
+                )
+                continue
+            try:
+                ev = CustomJudgeEvaluator(
+                    judge=judge, template=template, name=slug,
+                    threshold=float(threshold or 0.0),
+                )
+                result = await asyncio.to_thread(ev.evaluate, question=question, answer=answer)
+                await _persist_eval_result(
+                    organization_id, api_key_prefix, trace_id,
+                    evaluator="fluiq.eval",
+                    metric=slug,
+                    result=result,
+                    judge=judge,
+                )
+                logger.info(
+                    "[EVALUATOR] custom_judge %s org=%s trace_id=%s score=%.3f threshold=%.3f",
+                    slug, organization_id, trace_id, result.score, float(threshold or 0.0),
+                )
+            except Exception:
+                logger.exception(
+                    "[EVALUATOR] custom judge failed slug=%s trace_id=%s", slug, trace_id,
+                )
 
 
 async def playground_eval(message: Dict[str, Any]) -> None:

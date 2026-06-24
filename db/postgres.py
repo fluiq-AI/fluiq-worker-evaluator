@@ -63,6 +63,27 @@ class PostgresClient:
         except Exception:
             logger.exception("[EVALUATOR][PG] seed failed; using default prompts")
 
+    async def fetch_custom_judge(self, organization_id: Any, slug: str) -> Optional[str]:
+        """Return the live template for an org's client-defined judge prompt, or None.
+
+        Resolves a ``custom_judges`` slug from ``fluiq.eval()`` to the template saved
+        on the Prompts page (``kind = 'judge'``). Best-effort: returns None when the
+        pool is down or the slug doesn't resolve, so the metric is simply skipped.
+        """
+        if self._pool is None:
+            return None
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT template FROM prompts "
+                    "WHERE org_id = $1::uuid AND slug = $2 AND kind = 'judge'",
+                    str(organization_id), slug,
+                )
+            return row["template"] if row else None
+        except Exception:
+            logger.exception("[EVALUATOR][PG] custom judge fetch failed slug=%s", slug)
+            return None
+
     async def fetch_judge_prompts(self) -> list[dict[str, Any]]:
         """Return [{name, template, required_vars}] or [] when unavailable."""
         if self._pool is None:
