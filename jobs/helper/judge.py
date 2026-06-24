@@ -6,6 +6,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional
 
+from jobs.helper import judge_prompts
 from jobs.helper.base import _parse_json_object
 
 
@@ -19,12 +20,6 @@ DEFAULT_MODELS: Dict[str, str] = {
     "gemini":    "gemini-2.5-flash",
     "fluiq":     "fluiq-judge",
 }
-
-_SYSTEM_PROMPT = (
-    "You are a strict evaluator. Always respond with a single valid JSON "
-    "object and nothing else."
-)
-
 
 class LLMJudge:
     """LLM-as-judge with pluggable providers (openai, anthropic, gemini, fluiq)."""
@@ -76,7 +71,7 @@ class LLMJudge:
             model=self.model,
             temperature=self.temperature,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": judge_prompts.system_prompt()},
                 {"role": "user",   "content": prompt},
             ],
             response_format={"type": "json_object"},
@@ -95,7 +90,7 @@ class LLMJudge:
             model=self.model,
             max_tokens=1024,
             temperature=self.temperature,
-            system=_SYSTEM_PROMPT,
+            system=judge_prompts.system_prompt(),
             messages=[{"role": "user", "content": prompt}],
         )
         for block in getattr(resp, "content", []) or []:
@@ -117,7 +112,7 @@ class LLMJudge:
             model=self.model,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
+                system_instruction=judge_prompts.system_prompt(),
                 temperature=self.temperature,
                 response_mime_type="application/json",
             ),

@@ -60,3 +60,11 @@ CLICKHOUSE_SECURITY_TABLE    = os.getenv("CLICKHOUSE_SECURITY_TABLE")
 
 KAFKA_SECURITY_REPLY_TOPIC   = os.getenv("KAFKA_SECURITY_REPLY_TOPIC")
 KAFKA_PLAYGROUND_REPLY_TOPIC = os.getenv("KAFKA_PLAYGROUND_REPLY_TOPIC")
+
+# Postgres holds the admin-editable LLM-as-Judge prompt overrides. Optional:
+# when unset, the worker uses its built-in default prompts (fail-open) and the
+# Admin "Judge Prompts" tab simply has no effect on this worker.
+POSTGRES_DSN = os.getenv("POSTGRES_DSN")
+# How long (seconds) a loaded judge-prompt snapshot is trusted before the next
+# eval triggers a refresh from Postgres.
+JUDGE_PROMPT_CACHE_TTL = float(os.getenv("EVAL_JUDGE_PROMPT_TTL", "60"))

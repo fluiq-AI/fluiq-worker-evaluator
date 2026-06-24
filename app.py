@@ -9,6 +9,8 @@ from aiokafka import AIOKafkaConsumer
 
 from db.clickhouse import clickhouse_eval_client
 from db.kafka import kafka_producer
+from db.postgres import postgres_client
+from jobs.helper import judge_prompts
 from jobs.run import auto_evaluate_retrieval, auto_llm_eval, playground_eval, run_evaluation
 
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +43,10 @@ async def dispatch(message: dict[str, Any]) -> None:
     if handler is None:
         logger.warning("[EVALUATOR] Unknown operation: %s", operation)
         return
+    # Pull any admin-edited judge-prompt overrides into the in-process snapshot.
+    # TTL-gated and best-effort, so this is a cheap no-op on most messages and
+    # never blocks evaluation if Postgres is slow or unset.
+    await judge_prompts.refresh()
     await handler(message)
 
 
@@ -68,6 +74,11 @@ async def consume() -> None:
     await consumer.start()
     await clickhouse_eval_client.start()
     await kafka_producer.start()
+    # Judge-prompt overrides (optional): connect, seed canonical defaults, and
+    # prime the snapshot. All best-effort — failures fall back to built-ins.
+    await postgres_client.start()
+    await judge_prompts.seed()
+    await judge_prompts.refresh(force=True)
     logger.info(
         "[EVALUATOR] Consuming topic=%s group=%s servers=%s",
         config.KAFKA_EVAL_TOPIC, config.KAFKA_EVAL_GROUP_ID, config.KAFKA_BOOTSTRAP_SERVERS,
@@ -86,6 +97,7 @@ async def consume() -> None:
         await consumer.stop()
         await kafka_producer.stop()
         await clickhouse_eval_client.stop()
+        await postgres_client.stop()
 
 
 def main() -> None:

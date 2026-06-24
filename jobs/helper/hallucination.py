@@ -1,28 +1,8 @@
 from typing import Any, List, Optional
 
+from jobs.helper import judge_prompts
 from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, _coerce_contexts
 from jobs.helper.judge import LLMJudge
-import datetime
-
-
-_CLAIMS_PROMPT = (
-    f"Today's date {datetime.datetime.now()}"
-    "Extract every standalone factual claim from the ANSWER below. "
-    "Return JSON: {{\"claims\": [\"claim 1\", \"claim 2\", ...]}}.\n\n"
-    "ANSWER:\n{answer}"
-)
-
-_VERIFY_PROMPT = (
-    f"Today's date {datetime.datetime.now()}"
-    "You are checking whether each CLAIM is supported by the REFERENCE. "
-    "A claim is SUPPORTED only if the reference entails it; if the reference "
-    "neither states nor implies it, mark it UNSUPPORTED. Speculation, added "
-    "details, and contradictions are UNSUPPORTED.\n\n"
-    "REFERENCE:\n{reference}\n\n"
-    "CLAIMS:\n{claims}\n\n"
-    "Return JSON: {{\"verdicts\": [{{\"claim\": str, \"supported\": bool, "
-    "\"reason\": str}}]}}"
-)
 
 
 class HallucinationEvaluator(BaseEvaluator):
@@ -42,13 +22,11 @@ class HallucinationEvaluator(BaseEvaluator):
         if not reference_text:
             # No retrieval context — use LLM general knowledge to assess factual accuracy.
             data = self.judge.judge_json(
-                f"Today's date {datetime.datetime.now()}"
-                "Evaluate whether the ANSWER contains any factual errors or hallucinations "
-                "based on your general knowledge. Score 1.0 = fully accurate, 0.0 = completely "
-                "hallucinated or wrong.\n\n"
-                "Return JSON: {\"score\": float, \"reason\": str}.\n\n"
-                + (f"QUESTION: {question}\n" if question else "")
-                + f"ANSWER: {answer}"
+                judge_prompts.render(
+                    "hallucination_no_context",
+                    answer=answer,
+                    question_block=judge_prompts.question_block(question),
+                )
             )
             score = _clamp_unit(data.get("score"), default=0.5)
             return self._result(score, str(data.get("reason") or ""), data)
@@ -77,12 +55,13 @@ class HallucinationEvaluator(BaseEvaluator):
         })
 
     def _extract_claims(self, answer: str) -> List[str]:
-        data = self.judge.judge_json(_CLAIMS_PROMPT.format(answer=answer))
+        data = self.judge.judge_json(judge_prompts.render("hallucination_claims", answer=answer))
         raw = data.get("claims") or []
         return [str(c).strip() for c in raw if isinstance(raw, list) and str(c).strip()]
 
     def _verify_claims(self, reference: str, claims: List[str]) -> List[dict]:
-        prompt = _VERIFY_PROMPT.format(
+        prompt = judge_prompts.render(
+            "hallucination_verify",
             reference=reference,
             claims="\n".join(f"- {c}" for c in claims),
         )
