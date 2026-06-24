@@ -213,23 +213,28 @@ async def refresh(force: bool = False) -> None:
     snapshot = dict(_DEFAULTS)
     for r in rows:
         name = r.get("name")
-        if name not in _DEFAULTS:
-            continue  # unknown key — ignore
+        if not name:
+            continue
         template = r.get("template") or ""
-        if _is_valid_override(name, template):
-            snapshot[name] = template
-        else:
+        # Known prompts: validate required vars, else keep the default. Custom
+        # admin-created prompts (not in _DEFAULTS) have no required vars to check
+        # and are loaded as-is so future evaluator code can render them.
+        if name in _DEFAULTS and not _is_valid_override(name, template):
             logger.warning(
                 "[JUDGE-PROMPTS] override for %r missing required vars; using default",
                 name,
             )
+            continue
+        if template.strip():
+            snapshot[name] = template
     with _lock:
+        _effective.clear()
         _effective.update(snapshot)
 
 
 def get_template(name: str) -> str:
     with _lock:
-        return _effective.get(name) or _DEFAULTS[name]
+        return _effective.get(name) or _DEFAULTS.get(name) or ""
 
 
 def system_prompt() -> str:
@@ -245,7 +250,7 @@ def render(name: str, **values: Any) -> str:
         return Template(template).safe_substitute(values)
     except Exception:
         logger.exception("[JUDGE-PROMPTS] render failed for %r; using default", name)
-        return Template(_DEFAULTS[name]).safe_substitute(values)
+        return Template(_DEFAULTS.get(name) or "").safe_substitute(values)
 
 
 def question_block(question: Any) -> str:
