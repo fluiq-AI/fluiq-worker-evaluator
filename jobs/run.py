@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import config
 
+from jobs.helper.base import EvalResult
 from jobs.helper.judge import InMemoryCache, LLMJudge, PromptCache
 from jobs.helper.hallucination import HallucinationEvaluator
 from jobs.helper.ragas import (
@@ -31,8 +32,11 @@ _RETRIEVAL_APIS = {
 }
 
 
-def _build_judge() -> LLMJudge:
-    judge = LLMJudge(provider=config.JUDGE_PROVIDER, model=config.JUDGE_MODEL)
+def _build_judge(provider: Optional[str] = None, model: Optional[str] = None) -> LLMJudge:
+    judge = LLMJudge(
+        provider=provider or config.JUDGE_PROVIDER,
+        model=model or config.JUDGE_MODEL,
+    )
     if _judge_cache_backend is None:
         return judge
 
@@ -73,6 +77,12 @@ def _build_evaluator(name: str, judge: LLMJudge):
         return Toxicity(judge=judge, threshold=config.JUDGE_THRESHOLD)
     if n in ("coherence","ragas.coherence"):
         return Coherence(judge=judge, threshold=config.JUDGE_THRESHOLD)
+    if n in ("vision_faithfulness", "vision", "vision.faithfulness"):
+        from jobs.helper.vision import VisionFaithfulness
+        return VisionFaithfulness(judge=judge, threshold=config.JUDGE_THRESHOLD)
+    if n in ("media_faithfulness", "media", "av_faithfulness"):
+        from jobs.helper.vision import MediaFaithfulness
+        return MediaFaithfulness(judge=judge, threshold=config.JUDGE_THRESHOLD)
     raise ValueError(f"Unknown evaluator: {name!r}")
 
 
@@ -277,7 +287,11 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
     for metric_name in metrics:
         try:
             ev = _build_evaluator(metric_name, judge)
-            result = await asyncio.to_thread(ev.evaluate, question=question, answer=answer)
+            # Pass the raw event so vision metrics can pull media refs from the
+            # trace; text-only evaluators ignore the extra kwargs.
+            result = await asyncio.to_thread(
+                ev.evaluate, question=question, answer=answer, event=event,
+            )
             await _persist_eval_result(
                 organization_id, api_key_prefix, trace_id,
                 evaluator="fluiq.eval",
@@ -335,6 +349,118 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
                 logger.exception(
                     "[EVALUATOR] custom judge failed slug=%s trace_id=%s", slug, trace_id,
                 )
+
+
+async def agent_evaluate(message: Dict[str, Any]) -> None:
+    """Agentic evaluation (operation='agent_eval').
+
+    Normalizes any trace source (Fluiq envelope, OpenInference/OTel spans, or
+    raw JSON) into an ``AgentRun`` and runs the Phase 0→2 slice: deterministic
+    checks (Layer 1) + tool-selection-quality judge (Layer 2). One eval row is
+    persisted per LLM-judged metric; deterministic findings ride along in the
+    details so the UI can render per-call issues without a judge call.
+    """
+    from jobs.agentic.adapters import normalize
+    from jobs.agentic.orchestrator import evaluate_run
+    from jobs.agentic.panel import build_panel
+
+    organization_id = message.get("organization_id")
+    api_key_prefix  = message.get("api_key_prefix")
+
+    run = normalize(message)
+    trace_id      = message.get("trace_id") or run.run_id
+    root_trace_id = message.get("root_trace_id") or run.run_id or trace_id
+
+    if not run.tool_calls and len(run.steps) < 2:
+        # A single LLM turn with no tool calls has no agentic trajectory to
+        # assess, and is already covered by the per-call hallucination/relevance
+        # eval — so there's nothing agentic to add here. Multi-step reasoning
+        # runs (>=2 steps) ARE evaluated below even without tools: L1
+        # deterministic and L3 trajectory judge the steps/final answer and are
+        # tool-agnostic; only the L2 tool-selection layer needs tool calls.
+        logger.info(
+            "[EVALUATOR] agent_eval trace_id=%s has no tool calls and <2 steps; "
+            "nothing agentic to evaluate; skipping", trace_id,
+        )
+        return
+
+    # Per-message overrides fall back to server config.
+    depth      = (message.get("depth") or config.EVAL_AGENT_DEPTH).lower()
+    panel_mode = (message.get("panel_mode") or config.EVAL_PANEL_MODE).lower()
+
+    judge = _build_judge()
+    panel = None
+    if depth == "deep":
+        panel = build_panel(
+            primary=judge,
+            member_specs=config.panel_members(),
+            mode=panel_mode,
+            gate_margin=config.EVAL_PANEL_GATE_MARGIN,
+            threshold=config.JUDGE_THRESHOLD,
+            judge_factory=_build_judge,
+        )
+
+    outcome = await asyncio.to_thread(
+        evaluate_run, run, judge, config.JUDGE_THRESHOLD,
+        depth=depth, panel=panel,
+    )
+
+    det = outcome["deterministic"]
+    run_score  = outcome["run_score"]
+    run_passed = outcome["run_passed"]
+    metric_layers = outcome["metric_layers"]
+
+    # Layer 1 gets its own queryable row (no judge cost), so dashboards can
+    # separate deterministic pass-rate from judged quality.
+    det_result = EvalResult(
+        name="agentic.deterministic",
+        score=float(det.get("score", 1.0)),
+        passed=bool(det.get("error_calls", 0) == 0),
+        reason=f"{det.get('error_calls', 0)} call(s) with errors of {det.get('total_calls', 0)}",
+        details=det,
+    )
+    await _persist_eval_result(
+        organization_id, api_key_prefix, trace_id,
+        evaluator="fluiq.agent_eval",
+        metric="agentic.deterministic",
+        result=det_result,
+        judge=judge,
+        root_trace_id=root_trace_id,
+        details_override=det,
+        layer="deterministic",
+        run_score=run_score,
+        run_passed=run_passed,
+    )
+
+    for metric_name, result in outcome["metrics"].items():
+        # Flatten: the evaluator's own details (panel, subgoals, efficiency,
+        # goal_completion, agents, joins, …) go TOP-LEVEL in the CH details
+        # column. The dashboard reads them flat (``details.panel`` &c.) — the
+        # previous ``model_dump()`` shape nested them under details.details,
+        # which left the jury trace invisible in the UI.
+        details = dict(result.details or {})
+        details["reason"]        = result.reason
+        details["deterministic"] = det
+        details["run_score"]     = run_score
+        details["run_passed"]    = run_passed
+        await _persist_eval_result(
+            organization_id, api_key_prefix, trace_id,
+            evaluator="fluiq.agent_eval",
+            metric=metric_name,
+            result=result,
+            judge=judge,
+            root_trace_id=root_trace_id,
+            details_override=details,
+            layer=metric_layers.get(metric_name, ""),
+            run_score=run_score,
+            run_passed=run_passed,
+        )
+    logger.info(
+        "[EVALUATOR] agent_eval trace_id=%s source=%s depth=%s calls=%d "
+        "run_score=%.3f det_errors=%d metrics=%s passed=%s",
+        trace_id, run.source, outcome["depth"], outcome["tool_call_count"],
+        run_score, det.get("error_calls", 0), list(outcome["metrics"]), run_passed,
+    )
 
 
 async def playground_eval(message: Dict[str, Any]) -> None:
@@ -433,6 +559,10 @@ async def _persist_eval_result(
     judge: LLMJudge,
     root_trace_id: Optional[str] = None,
     details_override: Optional[Dict[str, Any]] = None,
+    layer: str = "",
+    step_id: str = "",
+    run_score: float = 0.0,
+    run_passed: bool = True,
 ) -> None:
     details = details_override if details_override is not None else result.model_dump(mode="json")
     details.setdefault("judge_provider", judge.provider)
@@ -447,6 +577,10 @@ async def _persist_eval_result(
         "score":           score,
         "judge_model":     judge.model,
         "details":         details,
+        "layer":           layer,
+        "step_id":         step_id,
+        "run_score":       run_score,
+        "run_passed":      run_passed,
     }
     await clickhouse_eval_client.insert_evaluation(record)
 

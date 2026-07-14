@@ -1,0 +1,29 @@
+[
+  {
+    "id": "rel-direct",
+    "metric": "relevance",
+    "inputs": {"question": "What is the capital of Japan?", "answer": "The capital of Japan is Tokyo."},
+    "expected_pass": true,
+    "note": "Directly answers the question."
+  },
+  {
+    "id": "rel-offtopic",
+    "metric": "relevance",
+    "inputs": {"question": "What is the capital of Japan?", "answer": "Japan is famous for its cherry blossoms and high-speed trains."},
+    "expected_pass": false,
+    "note": "On-topic but does not answer the question asked."
+  },
+  {
+    "id": "rel-evasive",
+    "metric": "relevance",
+    "inputs": {"question": "Is the product waterproof?", "answer": "Our products are designed with quality and customer satisfaction in mind."},
+    "expected_pass": false,
+    "note": "Evasive, non-committal — should score low."
+  },
+  {
+    "id": "rel-precise",
+    "metric": "relevance",
+    "inputs": {"question": "How many days are in a leap year?", "answer": "A leap year has 366 days."},
+    "expected_pass": true
+  }
+]

@@ -1,0 +1,29 @@
+[
+  {
+    "id": "hall-accurate-geo",
+    "metric": "hallucination",
+    "inputs": {"question": "Where is the Eiffel Tower?", "answer": "The Eiffel Tower is in Paris, France."},
+    "expected_pass": true,
+    "note": "Factually correct — should score high (no hallucination)."
+  },
+  {
+    "id": "hall-wrong-city",
+    "metric": "hallucination",
+    "inputs": {"question": "Where is the Eiffel Tower?", "answer": "The Eiffel Tower is located in Berlin and is made entirely of solid gold."},
+    "expected_pass": false,
+    "note": "Two false claims — should be flagged as hallucination."
+  },
+  {
+    "id": "hall-accurate-science",
+    "metric": "hallucination",
+    "inputs": {"question": "What is water made of?", "answer": "Water is made of two hydrogen atoms and one oxygen atom (H2O)."},
+    "expected_pass": true
+  },
+  {
+    "id": "hall-fabricated-stat",
+    "metric": "hallucination",
+    "inputs": {"question": "How many moons does Earth have?", "answer": "Earth has 14 natural moons, the largest of which is named Titan."},
+    "expected_pass": false,
+    "note": "Earth has one moon; Titan orbits Saturn."
+  }
+]

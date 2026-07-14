@@ -1,0 +1,93 @@
+[
+  {
+    "id": "tsq-good",
+    "metric": "agentic.tool_selection_quality",
+    "kind": "agentic",
+    "trace": {"events": [
+      {"integration": "ANTHROPIC", "type": "llm", "trace_id": "t1",
+       "messages": [{"role": "user", "content": [{"type": "text", "text": "What's the weather in Paris?"}]}],
+       "tools": [{"name": "get_weather", "description": "Get current weather for a city",
+                  "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}],
+       "tool_uses": [{"type": "tool_use", "id": "tu1", "name": "get_weather", "input": {"location": "Paris"}}]}
+    ]},
+    "expected_pass": true,
+    "note": "Correct tool with the right argument for the goal."
+  },
+  {
+    "id": "tsq-bad-unknown-tool",
+    "metric": "agentic.tool_selection_quality",
+    "kind": "agentic",
+    "trace": {"events": [
+      {"integration": "ANTHROPIC", "type": "llm", "trace_id": "t1",
+       "messages": [{"role": "user", "content": [{"type": "text", "text": "What's the weather in Paris?"}]}],
+       "tools": [{"name": "get_weather", "description": "Get current weather for a city",
+                  "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}],
+       "tool_uses": [{"type": "tool_use", "id": "tu1", "name": "get_stock_price", "input": {"ticker": "AAPL"}}]}
+    ]},
+    "expected_pass": false,
+    "note": "Called a tool not in the toolset, irrelevant to the goal."
+  },
+  {
+    "id": "traj-good",
+    "metric": "agentic.trajectory",
+    "kind": "agentic",
+    "trace": {"events": [
+      {"integration": "ANTHROPIC", "type": "llm", "trace_id": "r",
+       "messages": [{"role": "user", "content": [{"type": "text", "text": "Book a table for 2 at 7pm at a nearby bistro and confirm."}]}],
+       "tools": [{"name": "search_restaurants", "input_schema": {"type": "object", "properties": {"party": {"type": "integer"}}}},
+                 {"name": "book_table", "input_schema": {"type": "object", "properties": {"restaurant": {"type": "string"}, "time": {"type": "string"}, "party": {"type": "integer"}}, "required": ["restaurant", "time"]}}]},
+      {"type": "llm", "trace_id": "a", "parent_id": "r", "response": "Found Bistro Rivoli with availability.",
+       "tool_uses": [{"type": "tool_use", "id": "u1", "name": "search_restaurants", "input": {"party": 2}}]},
+      {"type": "llm", "trace_id": "b", "parent_id": "a", "response": "Table booked at Bistro Rivoli for 2 at 7pm.",
+       "tool_uses": [{"type": "tool_use", "id": "u2", "name": "book_table", "input": {"restaurant": "Bistro Rivoli", "time": "19:00", "party": 2}}]}
+    ]},
+    "expected_pass": true,
+    "note": "Searched then booked — reached the goal efficiently."
+  },
+  {
+    "id": "traj-bad-loop",
+    "metric": "agentic.trajectory",
+    "kind": "agentic",
+    "trace": {"events": [
+      {"integration": "ANTHROPIC", "type": "llm", "trace_id": "r",
+       "messages": [{"role": "user", "content": [{"type": "text", "text": "Book a table for 2 at 7pm and confirm."}]}],
+       "tools": [{"name": "search_restaurants", "input_schema": {"type": "object", "properties": {"party": {"type": "integer"}}}}]},
+      {"type": "llm", "trace_id": "a", "parent_id": "r", "tool_uses": [{"type": "tool_use", "id": "u1", "name": "search_restaurants", "input": {"party": 2}}]},
+      {"type": "llm", "trace_id": "b", "parent_id": "a", "tool_uses": [{"type": "tool_use", "id": "u2", "name": "search_restaurants", "input": {"party": 2}}]},
+      {"type": "llm", "trace_id": "c", "parent_id": "b", "response": "Still searching...",
+       "tool_uses": [{"type": "tool_use", "id": "u3", "name": "search_restaurants", "input": {"party": 2}}]}
+    ]},
+    "expected_pass": false,
+    "note": "Looped on the same search and never booked — goal not achieved."
+  },
+  {
+    "id": "coord-good",
+    "metric": "agentic.coordination",
+    "kind": "agentic",
+    "trace": {"events": [
+      {"integration": "LANGGRAPH", "type": "llm", "trace_id": "r", "langgraph": {"langgraph_node": "router"},
+       "messages": [{"role": "user", "content": "Research X and Y, then combine both."}]},
+      {"type": "llm", "trace_id": "a", "parent_id": "r", "langgraph": {"langgraph_node": "researcher_x"}, "response": "X finding: alpha."},
+      {"type": "llm", "trace_id": "b", "parent_id": "r", "langgraph": {"langgraph_node": "researcher_y"}, "response": "Y finding: beta."},
+      {"type": "llm", "trace_id": "j", "parent_ids": ["a", "b"], "langgraph": {"langgraph_node": "synthesizer"},
+       "response": "Combined report: alpha (from X research) and beta (from Y research)."}
+    ]},
+    "expected_pass": true,
+    "note": "Synthesizer incorporated both branches."
+  },
+  {
+    "id": "coord-bad-dropped-branch",
+    "metric": "agentic.coordination",
+    "kind": "agentic",
+    "trace": {"events": [
+      {"integration": "LANGGRAPH", "type": "llm", "trace_id": "r", "langgraph": {"langgraph_node": "router"},
+       "messages": [{"role": "user", "content": "Research X and Y, then combine both."}]},
+      {"type": "llm", "trace_id": "a", "parent_id": "r", "langgraph": {"langgraph_node": "researcher_x"}, "response": "X finding: alpha."},
+      {"type": "llm", "trace_id": "b", "parent_id": "r", "langgraph": {"langgraph_node": "researcher_y"}, "response": "Y finding: beta."},
+      {"type": "llm", "trace_id": "j", "parent_ids": ["a", "b"], "langgraph": {"langgraph_node": "synthesizer"},
+       "response": "Report: alpha. (Only the X research is reflected.)"}
+    ]},
+    "expected_pass": false,
+    "note": "Synthesizer dropped the researcher_y branch — a coordination failure."
+  }
+]

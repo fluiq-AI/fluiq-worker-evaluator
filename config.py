@@ -43,6 +43,28 @@ KAFKA_EVAL_GROUP_ID = os.getenv("KAFKA_EVAL_GROUP_ID")
 JUDGE_PROVIDER = os.getenv("EVAL_JUDGE_PROVIDER")
 JUDGE_MODEL = os.getenv("EVAL_JUDGE_MODEL")
 JUDGE_THRESHOLD = float(os.getenv("EVAL_JUDGE_THRESHOLD"))
+
+# ── Agentic evaluator (L3 trajectory + L4 multi-agent panel) ──────────────────
+# Depth per run: "fast" (L1+L2), "standard" (+L3 trajectory), "deep" (+L4 panel).
+EVAL_AGENT_DEPTH = os.getenv("EVAL_AGENT_DEPTH", "standard")
+# Panel mode: "off" (single judge), "gated" (escalate near threshold — cheap &
+# recommended), "always" (full panel every metric — max quality, max cost).
+EVAL_PANEL_MODE = os.getenv("EVAL_PANEL_MODE", "gated")
+EVAL_PANEL_GATE_MARGIN = float(os.getenv("EVAL_PANEL_GATE_MARGIN", "0.12"))
+# Comma-separated jurors as provider:model, e.g.
+# "anthropic:claude-haiku-4-5-20251001,gemini:gemini-2.5-flash,openai:gpt-4o-mini"
+EVAL_PANEL_MEMBERS = os.getenv("EVAL_PANEL_MEMBERS", "")
+
+
+def panel_members() -> list[tuple[str, str]]:
+    """Parse ``EVAL_PANEL_MEMBERS`` into ``[(provider, model), ...]``."""
+    out: list[tuple[str, str]] = []
+    for part in (EVAL_PANEL_MEMBERS or "").split(","):
+        part = part.strip()
+        if part and ":" in part:
+            provider, model = part.split(":", 1)
+            out.append((provider.strip(), model.strip()))
+    return out
 JUDGE_CACHE_ENABLED = os.getenv("EVAL_JUDGE_CACHE")
 JUDGE_CACHE_TTL = float(os.getenv("EVAL_JUDGE_CACHE_TTL"))
 JUDGE_CACHE_MAX = int(os.getenv("EVAL_JUDGE_CACHE_MAX"))

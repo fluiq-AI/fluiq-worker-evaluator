@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Optional
 import config
@@ -127,6 +128,34 @@ class ClickHouseEvalClient:
             ],
         )
 
+    async def fetch_recent_trace_events(
+        self,
+        limit: int = 200,
+        since_hours: int = 168,
+        table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Pull recent raw trace events (for calibration harvesting)."""
+        if self._client is None:
+            await self.start()
+        target = table or config.CLICKHOUSE_TRACE_TABLE
+        result = await self._client.query(
+            f"SELECT event FROM {target} "
+            f"WHERE ingested_at >= now() - toIntervalHour({{h:UInt32}}) "
+            f"ORDER BY ingested_at DESC LIMIT {{lim:UInt32}}",
+            parameters={"h": int(since_hours), "lim": int(limit)},
+        )
+        out: list[dict[str, Any]] = []
+        for row in result.result_rows:
+            ev = row[0]
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            if isinstance(ev, dict):
+                out.append(ev)
+        return out
+
     async def insert_evaluation(
         self,
         record: dict[str, Any],
@@ -153,6 +182,10 @@ class ClickHouseEvalClient:
                 score,
                 record.get("judge_model") or "",
                 record.get("details") or {},
+                record.get("layer") or "",
+                record.get("step_id") or "",
+                float(record.get("run_score") or 0.0),
+                int(bool(record.get("run_passed", True))),
             ]],
             column_names=[
                 "organization_id",
@@ -164,6 +197,10 @@ class ClickHouseEvalClient:
                 "score",
                 "judge_model",
                 "details",
+                "layer",
+                "step_id",
+                "run_score",
+                "run_passed",
             ],
         )
 

@@ -40,6 +40,10 @@ class LLMJudge:
         self.model = model or DEFAULT_MODELS[provider]
         self.temperature = temperature
         self._judge_fn = judge_fn
+        # Optional test/override hook for the multimodal path: (prompt, media) -> str.
+        # Kept separate from ``_judge_fn`` so the text-only judge cache never
+        # swallows the images.
+        self._multimodal_fn: Optional[Callable[[str, list], str]] = None
         self._api_key = api_key
         self._client = None
 
@@ -58,6 +62,90 @@ class LLMJudge:
 
     def judge_json(self, prompt: str) -> Dict[str, Any]:
         return _parse_json_object(self(prompt))
+
+    # ── multimodal (vision) judging ──────────────────────────────────────────
+    def supports_vision(self) -> bool:
+        """Whether this provider path can attach images to the judge call."""
+        return self.provider in ("openai", "anthropic", "gemini")
+
+    def judge_multimodal_json(self, prompt: str, media: list) -> Dict[str, Any]:
+        """Judge ``prompt`` with image ``media`` attached; returns parsed JSON.
+
+        ``media`` items are normalized dicts: ``{kind, mime, url?|data?}``.
+        The multimodal path deliberately bypasses the text-only judge cache
+        (``_judge_fn``) so images are never dropped."""
+        if self._multimodal_fn is not None:
+            return _parse_json_object(self._multimodal_fn(prompt, media))
+        if self.provider == "openai":
+            return _parse_json_object(self._call_openai_mm(prompt, media))
+        if self.provider == "anthropic":
+            return _parse_json_object(self._call_anthropic_mm(prompt, media))
+        if self.provider == "gemini":
+            return _parse_json_object(self._call_gemini_mm(prompt, media))
+        raise RuntimeError(f"provider {self.provider!r} does not support vision judging")
+
+    def _call_openai_mm(self, prompt: str, media: list) -> str:
+        from jobs.helper.vision import build_openai_content
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError("judge provider 'openai' requires the `openai` package") from exc
+        if self._client is None:
+            key = self._api_key or os.getenv("OPENAI_API_KEY")
+            self._client = OpenAI(api_key=key) if key else OpenAI()
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            messages=[
+                {"role": "system", "content": judge_prompts.system_prompt()},
+                {"role": "user", "content": build_openai_content(prompt, media)},
+            ],
+            response_format={"type": "json_object"},
+        )
+        return resp.choices[0].message.content or "{}"
+
+    def _call_anthropic_mm(self, prompt: str, media: list) -> str:
+        from jobs.helper.vision import build_anthropic_content
+        try:
+            import anthropic
+        except ImportError as exc:
+            raise RuntimeError("judge provider 'anthropic' requires the `anthropic` package") from exc
+        if self._client is None:
+            key = self._api_key or os.getenv("ANTHROPIC_API_KEY")
+            self._client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
+        resp = self._client.messages.create(
+            model=self.model,
+            max_tokens=1024,
+            temperature=self.temperature,
+            system=judge_prompts.system_prompt(),
+            messages=[{"role": "user", "content": build_anthropic_content(prompt, media)}],
+        )
+        for block in getattr(resp, "content", []) or []:
+            text = getattr(block, "text", None)
+            if text:
+                return text
+        return "{}"
+
+    def _call_gemini_mm(self, prompt: str, media: list) -> str:
+        from jobs.helper.vision import build_gemini_parts
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RuntimeError("judge provider 'gemini' requires the `google-genai` package") from exc
+        if self._client is None:
+            key = self._api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            self._client = genai.Client(api_key=key) if key else genai.Client()
+        resp = self._client.models.generate_content(
+            model=self.model,
+            contents=build_gemini_parts(prompt, media),
+            config=types.GenerateContentConfig(
+                system_instruction=judge_prompts.system_prompt(),
+                temperature=self.temperature,
+                response_mime_type="application/json",
+            ),
+        )
+        return getattr(resp, "text", None) or "{}"
 
     def _call_openai(self, prompt: str) -> str:
         try:
