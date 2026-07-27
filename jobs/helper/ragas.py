@@ -222,6 +222,44 @@ class Coherence(BaseEvaluator):
             },
         )
 
+class Completeness(BaseEvaluator):
+    """Measures whether the answer fully addresses every part of the question."""
+
+    name = "ragas.completeness"
+
+    def __init__(self, judge: Optional[LLMJudge] = None, threshold: float = 0.7):
+        super().__init__(threshold=threshold)
+        self.judge = judge or LLMJudge()
+
+    def evaluate(
+        self,
+        answer: str,
+        question: Optional[str] = None,
+        **_: Any,
+    ) -> EvalResult:
+        if not answer.strip():
+            return self._result(0.0, "empty answer")
+
+        data = self.judge.judge_json(
+            judge_prompts.render(
+                "completeness",
+                answer=answer,
+                question_block=judge_prompts.question_block(question),
+            )
+        )
+
+        score = _clamp_unit(float(data.get("score", 0.0)))
+        missing = data.get("missing")
+
+        return self._result(
+            score,
+            data.get("reason", "completeness evaluation completed"),
+            {
+                "missing": missing if isinstance(missing, list) else [],
+            },
+        )
+
+
 class Ragas:
     """Convenience runner that executes the four core RAGAS metrics."""
 
@@ -241,15 +279,18 @@ class Ragas:
         contexts: Any,
         reference: Optional[str] = None,
     ) -> Dict[str, EvalResult]:
+        # Each metric runs under its own prompt capture so its result carries
+        # exactly the judge prompts that produced it.
         results: Dict[str, EvalResult] = {
-            "faithfulness":      self.faithfulness.evaluate(question=question, answer=answer, contexts=contexts),
-            "answer_relevancy":  self.answer_relevancy.evaluate(question=question, answer=answer),
-            "context_precision": self.context_precision.evaluate(question=question, contexts=contexts, reference=reference),
-            "toxicity": self.toxicity.evaluate(question=question, answer=answer),
-            "coherence": self.coherence.evaluate(answer=answer, question=question)
+            "faithfulness":      judge_prompts.captured_call(self.faithfulness.evaluate, question=question, answer=answer, contexts=contexts),
+            "answer_relevancy":  judge_prompts.captured_call(self.answer_relevancy.evaluate, question=question, answer=answer),
+            "context_precision": judge_prompts.captured_call(self.context_precision.evaluate, question=question, contexts=contexts, reference=reference),
+            "toxicity":  judge_prompts.captured_call(self.toxicity.evaluate, question=question, answer=answer),
+            "coherence": judge_prompts.captured_call(self.coherence.evaluate, answer=answer, question=question),
         }
         if reference:
-            results["context_recall"] = self.context_recall.evaluate(
+            results["context_recall"] = judge_prompts.captured_call(
+                self.context_recall.evaluate,
                 question=question, reference=reference, contexts=contexts,
             )
         return results

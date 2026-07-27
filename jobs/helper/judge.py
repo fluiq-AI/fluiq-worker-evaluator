@@ -12,17 +12,109 @@ from jobs.helper.base import _parse_json_object
 
 JudgeFn = Callable[[str], str]
 
-PROVIDERS = ("openai", "anthropic", "gemini", "fluiq")
+PROVIDERS = ("openai", "anthropic", "gemini", "moonshot")
+
+# Every judge provider is routed through polygate (Fluiq's own unified LLM
+# client) rather than each vendor's SDK, so the worker speaks one request/
+# response shape and gains key rotation + backoff for free. The vision path
+# stays on native SDKs — polygate's unified string-content messages can't
+# express image blocks across all three providers (Gemini in particular).
+_POLYGATE_TEXT_PROVIDERS = ("openai", "anthropic", "gemini", "moonshot")
+
+# Judge calls are idempotent, so transient provider failures (429 / 5xx /
+# Anthropic's 529 overload) are safe to retry. polygate rotates across the key
+# pool first and only sleeps once every key is busy. Configurable; set to 1 to
+# disable and fall back to a single attempt per call.
+_JUDGE_RETRY_ATTEMPTS = max(1, int(os.getenv("EVAL_JUDGE_RETRY_ATTEMPTS", "3") or 3))
+
+
+def _judge_retry():
+    """A polygate ``Retry`` policy, or ``None`` when retries are disabled."""
+    if _JUDGE_RETRY_ATTEMPTS <= 1:
+        return None
+    from polygate import Retry
+    return Retry(max_attempts=_JUDGE_RETRY_ATTEMPTS)
+
+
+class JudgeUsage:
+    """Judge tokens actually spent, accumulated across every call that hit a provider.
+
+    Evals are the compute-heavy part of the product and the only part whose cost
+    scales with trace size, jury size, and judge model — none of which the
+    per-metric row count can see. Without this, judge spend is unmeasurable:
+    a 3-model jury over a 40-step trajectory and a one-shot relevance check are
+    indistinguishable after the fact.
+
+    A single instance is shared by the primary judge and every juror for one
+    eval message, so a panel's cost lands in one place. Cache hits deliberately
+    do not accumulate — a served-from-cache verdict spends no tokens, and
+    billing should reflect that.
+    """
+
+    __slots__ = ("input_tokens", "output_tokens", "calls", "_lock")
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def add(self, input_tokens: int, output_tokens: int) -> None:
+        with self._lock:
+            self.input_tokens += max(0, int(input_tokens or 0))
+            self.output_tokens += max(0, int(output_tokens or 0))
+            self.calls += 1
+
+    def drain(self) -> tuple[int, int, int]:
+        """Return ``(input, output, calls)`` and reset to zero.
+
+        One eval message can persist several metric rows. Draining means the
+        totals land on the first row and later rows carry zeros, so a SUM over
+        rows is the true per-message spend rather than a multiple of it.
+        """
+        with self._lock:
+            totals = (self.input_tokens, self.output_tokens, self.calls)
+            self.input_tokens = self.output_tokens = self.calls = 0
+            return totals
 
 DEFAULT_MODELS: Dict[str, str] = {
     "openai":    "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
     "gemini":    "gemini-2.5-flash",
-    "fluiq":     "fluiq-judge",
+    "moonshot":  "kimi-k2-0711-preview",
 }
 
+def _usage_openai(resp: Any) -> tuple[int, int]:
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return (0, 0)
+    return (getattr(u, "prompt_tokens", 0) or 0, getattr(u, "completion_tokens", 0) or 0)
+
+
+def _usage_anthropic(resp: Any) -> tuple[int, int]:
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return (0, 0)
+    # Cache reads/writes are billed differently but are still input tokens; count
+    # them so the total reflects what the provider actually charged for.
+    cached = (getattr(u, "cache_read_input_tokens", 0) or 0) + (
+        getattr(u, "cache_creation_input_tokens", 0) or 0
+    )
+    return ((getattr(u, "input_tokens", 0) or 0) + cached, getattr(u, "output_tokens", 0) or 0)
+
+
+def _usage_gemini(resp: Any) -> tuple[int, int]:
+    u = getattr(resp, "usage_metadata", None)
+    if u is None:
+        return (0, 0)
+    return (
+        getattr(u, "prompt_token_count", 0) or 0,
+        getattr(u, "candidates_token_count", 0) or 0,
+    )
+
+
 class LLMJudge:
-    """LLM-as-judge with pluggable providers (openai, anthropic, gemini, fluiq)."""
+    """LLM-as-judge with pluggable providers (openai, anthropic, gemini, moonshot)."""
 
     def __init__(
         self,
@@ -31,6 +123,7 @@ class LLMJudge:
         judge_fn: Optional[JudgeFn] = None,
         api_key: Optional[str] = None,
         temperature: float = 0.0,
+        usage: Optional["JudgeUsage"] = None,
     ):
         if provider not in PROVIDERS:
             raise ValueError(
@@ -46,18 +139,27 @@ class LLMJudge:
         self._multimodal_fn: Optional[Callable[[str, list], str]] = None
         self._api_key = api_key
         self._client = None
+        # Shared across the primary judge and its jurors when a panel is built,
+        # so one message's spend accumulates in a single place.
+        self.usage = usage if usage is not None else JudgeUsage()
+
+    def _record(self, input_tokens: Any, output_tokens: Any) -> None:
+        """Record one provider call. Never raises — usage is telemetry, not the answer.
+
+        Provider SDKs differ in where they hang usage and occasionally omit it
+        (streaming, cached responses, older API versions). A missing count must
+        under-report rather than fail the evaluation the customer asked for.
+        """
+        try:
+            self.usage.add(input_tokens, output_tokens)
+        except Exception:  # noqa: BLE001
+            pass
 
     def __call__(self, prompt: str) -> str:
         if self._judge_fn is not None:
             return self._judge_fn(prompt)
-        if self.provider == "openai":
-            return self._call_openai(prompt)
-        if self.provider == "anthropic":
-            return self._call_anthropic(prompt)
-        if self.provider == "gemini":
-            return self._call_gemini(prompt)
-        if self.provider == "fluiq":
-            return self._call_fluiq(prompt)
+        if self.provider in _POLYGATE_TEXT_PROVIDERS:
+            return self._chat_via_polygate(prompt)
         raise RuntimeError(f"Unsupported provider: {self.provider}")
 
     def judge_json(self, prompt: str) -> Dict[str, Any]:
@@ -102,6 +204,7 @@ class LLMJudge:
             ],
             response_format={"type": "json_object"},
         )
+        self._record(*_usage_openai(resp))
         return resp.choices[0].message.content or "{}"
 
     def _call_anthropic_mm(self, prompt: str, media: list) -> str:
@@ -120,6 +223,7 @@ class LLMJudge:
             system=judge_prompts.system_prompt(),
             messages=[{"role": "user", "content": build_anthropic_content(prompt, media)}],
         )
+        self._record(*_usage_anthropic(resp))
         for block in getattr(resp, "content", []) or []:
             text = getattr(block, "text", None)
             if text:
@@ -145,82 +249,89 @@ class LLMJudge:
                 response_mime_type="application/json",
             ),
         )
+        self._record(*_usage_gemini(resp))
         return getattr(resp, "text", None) or "{}"
 
+    # ── text judging via polygate ─────────────────────────────────────────────
+    # These keep their per-provider names because run.py's BYOK wrapper calls
+    # them directly, but each just defers to the unified polygate path — the
+    # provider is already fixed on the instance, so there's nothing to branch on.
     def _call_openai(self, prompt: str) -> str:
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("judge provider 'openai' requires the `openai` package") from exc
-        if self._client is None:
-            key = self._api_key or os.getenv("OPENAI_API_KEY")
-            self._client = OpenAI(api_key=key) if key else OpenAI()
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            temperature=self.temperature,
-            messages=[
-                {"role": "system", "content": judge_prompts.system_prompt()},
-                {"role": "user",   "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-        return resp.choices[0].message.content or "{}"
+        return self._chat_via_polygate(prompt)
+
+    def _call_moonshot(self, prompt: str) -> str:
+        return self._chat_via_polygate(prompt)
 
     def _call_anthropic(self, prompt: str) -> str:
-        try:
-            import anthropic
-        except ImportError as exc:
-            raise RuntimeError("judge provider 'anthropic' requires the `anthropic` package") from exc
-        if self._client is None:
-            key = self._api_key or os.getenv("ANTHROPIC_API_KEY")
-            self._client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
-        resp = self._client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            temperature=self.temperature,
-            system=judge_prompts.system_prompt(),
-            messages=[{"role": "user", "content": prompt}],
-        )
-        for block in getattr(resp, "content", []) or []:
-            text = getattr(block, "text", None)
-            if text:
-                return text
-        return "{}"
+        return self._chat_via_polygate(prompt)
 
     def _call_gemini(self, prompt: str) -> str:
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError as exc:
-            raise RuntimeError("judge provider 'gemini' requires the `google-genai` package") from exc
-        if self._client is None:
-            key = self._api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-            self._client = genai.Client(api_key=key) if key else genai.Client()
-        resp = self._client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=judge_prompts.system_prompt(),
-                temperature=self.temperature,
-                response_mime_type="application/json",
-            ),
-        )
-        return getattr(resp, "text", None) or "{}"
+        return self._chat_via_polygate(prompt)
 
-    def _call_fluiq(self, prompt: str) -> str:
-        import requests
-        import config as worker_config
-        api_key = self._api_key or os.getenv("FLUIQ_API_KEY")
-        if not api_key:
-            raise RuntimeError("judge provider 'fluiq' requires FLUIQ_API_KEY env var")
-        endpoint = os.getenv("FLUIQ_API_ENDPOINT", "https://api.getfluiq.com/api")
-        resp = requests.post(
-            f"{endpoint}/v1/judge",
-            json={"api_key": api_key, "model": self.model, "prompt": prompt, "temperature": self.temperature},
-            timeout=60,
+    def _chat_via_polygate(self, prompt: str) -> str:
+        """One request/response shape for every text provider, via polygate.
+
+        The system prompt goes in as a ``system`` message; polygate maps it to
+        each provider's native shape (Anthropic's top-level ``system`` field,
+        Gemini's ``systemInstruction``, an OpenAI/Moonshot system message).
+        JSON mode is requested where the provider supports it; Anthropic has no
+        JSON mode, so it relies on the system prompt plus ``_parse_json_object``
+        downstream, exactly as the SDK path did.
+        """
+        try:
+            from polygate import chat as polygate_chat
+        except ImportError as exc:  # pragma: no cover - packaging guard
+            raise RuntimeError(
+                "judge text providers require the `polygate` package"
+            ) from exc
+
+        provider = self.provider
+        messages = [
+            {"role": "system", "content": judge_prompts.system_prompt()},
+            {"role": "user",   "content": prompt},
+        ]
+        extra: Dict[str, Any] = {}
+        temperature: Optional[float] = self.temperature
+        max_tokens: Optional[int] = None
+
+        # Pass the BYOK key when we have one, else None so polygate reads the
+        # provider's own env var. For Moonshot that var is MOONSHOT_API_KEY —
+        # never OPENAI_API_KEY — so a keyless Moonshot judge refuses rather than
+        # borrowing an OpenAI credential, the guard the old SDK path enforced by
+        # hand. Gemini additionally honours GOOGLE_API_KEY, which polygate does
+        # not read, so resolve that fallback here.
+        api_key = self._api_key
+        if not api_key and provider == "gemini":
+            api_key = os.getenv("GOOGLE_API_KEY")
+
+        if provider in ("openai", "moonshot"):
+            extra["response_format"] = {"type": "json_object"}
+        elif provider == "gemini":
+            # polygate overwrites the whole generationConfig with this kwarg, so
+            # it has to carry the temperature too; a separate temperature= would
+            # be discarded.
+            extra["generationConfig"] = {
+                "temperature": self.temperature,
+                "responseMimeType": "application/json",
+            }
+            temperature = None
+        elif provider == "anthropic":
+            max_tokens = 1024  # Anthropic requires an explicit max_tokens.
+
+        resp = polygate_chat(
+            provider=provider,
+            model=self.model,
+            messages=messages,
+            api_key=api_key or None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            retry=_judge_retry(),
+            **extra,
         )
-        resp.raise_for_status()
-        return (resp.json() or {}).get("content") or "{}"
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self._record(usage.prompt_tokens, usage.completion_tokens)
+        return resp.content or "{}"
 
 
 # ── In-process judge response cache ──────────────────────────────────────────
@@ -264,7 +375,16 @@ class InMemoryCache:
 
 
 class PromptCache:
-    """Wraps a judge callable with keyed caching backed by ``InMemoryCache``."""
+    """Wraps a judge callable with keyed caching backed by ``InMemoryCache``.
+
+    ``namespace`` is the tenancy boundary. The backing cache is a single
+    process-wide instance shared by every eval the worker handles, so the key
+    MUST carry whatever distinguishes one caller's judge call from another's —
+    otherwise two orgs whose rendered judge prompts collide share a verdict,
+    leaking one org's judged content to the other. Callers pass the
+    organization id; when the credential paying for the call stops being
+    global (per-org provider keys), append its fingerprint here too.
+    """
 
     def __init__(
         self,
@@ -272,16 +392,30 @@ class PromptCache:
         model: str,
         backend: Optional[InMemoryCache],
         ttl: Optional[float] = None,
+        namespace: str = "",
     ) -> None:
         self._fn = fn
         self._model = model
         self._backend = backend
         self._ttl = ttl
+        self._namespace = namespace
 
     def __call__(self, prompt: str, **params: Any) -> str:
         if self._backend is None:
             return self._fn(prompt, **params)
-        raw = json.dumps({"model": self._model, "prompt": prompt, **params}, sort_keys=True, default=str)
+        # ``params`` is nested rather than splatted so a param named "model" or
+        # "prompt" can't shadow the fields above it and collapse distinct calls
+        # onto one key.
+        raw = json.dumps(
+            {
+                "namespace": self._namespace,
+                "model": self._model,
+                "prompt": prompt,
+                "params": params,
+            },
+            sort_keys=True,
+            default=str,
+        )
         key = hashlib.sha256(raw.encode()).hexdigest()
         cached = self._backend.get(key)
         if cached is not None:

@@ -1,5 +1,12 @@
+# Text judge calls (openai, anthropic, gemini, moonshot) go through polygate,
+# Fluiq's own unified LLM client — one wire shape plus key rotation + backoff.
+polygate>=0.2
+# The native provider SDKs below are retained only for the multimodal/vision
+# judge path, which polygate's text-only message shape can't express across all
+# providers (Gemini especially). If vision moves off the SDKs, drop these.
 anthropic>=0.34
 google-genai>=0.3
+openai>=1.40
 pydantic>=2.6
 aiokafka>=0.10
 clickhouse-connect>=0.7
@@ -12,3 +19,7 @@ aiohttp
 # Previously present only transitively via sentence-transformers; now that the
 # security deps are gone (moved to fluiq-workers/security), pin it directly.
 requests>=2.31
+
+# BYOK: unseal customer provider credentials (see jobs/helper/crypto.py).
+boto3
+cryptography

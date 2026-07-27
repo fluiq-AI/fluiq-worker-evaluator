@@ -2,8 +2,9 @@
 
 Runs a judge prompt the customer authored on the Prompts page (``kind='judge'``)
 and referenced by slug in ``fluiq.eval(custom_judges={slug: threshold})``. The
-template uses ``string.Template`` ``$question`` / ``$answer`` / ``$context``
-placeholders and is expected to return ``{"score": float, "reason": str}``.
+template uses ``{{question}}`` / ``{{answer}}`` / ``{{context}}`` placeholders
+(the legacy ``$answer`` form still substitutes) and is expected to return
+``{"score": float, "reason": str}``.
 
 The judge call goes through the same :class:`LLMJudge` (and response cache) as
 the built-in evaluators, so custom judges honour the configured judge provider /
@@ -11,9 +12,9 @@ model and benefit from caching.
 """
 from __future__ import annotations
 
-from string import Template
 from typing import Any
 
+from jobs.helper import judge_prompts
 from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit
 from jobs.helper.judge import LLMJudge
 
@@ -51,12 +52,31 @@ class CustomJudgeEvaluator(BaseEvaluator):
         context: str = "",
         **_: Any,
     ) -> EvalResult:
-        rendered = Template(_ensure_output_contract(self.template)).safe_substitute(
-            question=question or "",
-            answer=answer or "",
-            context=context or question or "",
+        rendered = judge_prompts.substitute(
+            _ensure_output_contract(self.template),
+            {
+                "question": question or "",
+                "answer":   answer or "",
+                "context":  context or question or "",
+            },
         )
         data = self.judge.judge_json(rendered)
         score = _clamp_unit(data.get("score"))
         reason = str(data.get("reason") or "")
-        return self._result(score, reason=reason, details={"custom_judge": self.name})
+        return self._result(
+            score,
+            reason=reason,
+            details={
+                "custom_judge": self.name,
+                # Same provenance shape the registry-backed evaluators emit, so
+                # the dashboard renders custom judges' prompts identically.
+                "judge_prompts": [{
+                    "name": self.name,
+                    "source": "custom",
+                    "version": None,
+                    "calls": 1,
+                    "truncated": len(rendered) > 6000,
+                    "rendered": rendered[:6000],
+                }],
+            },
+        )

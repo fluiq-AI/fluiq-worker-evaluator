@@ -1,15 +1,25 @@
 import asyncio
+import functools
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
 import config
 
+from jobs.helper import crypto, judge_prompts
 from jobs.helper.base import EvalResult
-from jobs.helper.judge import InMemoryCache, LLMJudge, PromptCache
+from jobs.helper.judge import (
+    PROVIDERS as JUDGE_PROVIDERS,
+    InMemoryCache,
+    JudgeUsage,
+    LLMJudge,
+    PromptCache,
+)
 from jobs.helper.hallucination import HallucinationEvaluator
 from jobs.helper.ragas import (
     AnswerRelevancy,
+    Completeness,
     ContextPrecision,
     ContextRecall,
     Faithfulness,
@@ -19,6 +29,7 @@ from jobs.helper.ragas import (
 )
 from db.clickhouse import clickhouse_eval_client
 from db.kafka import kafka_producer
+from db.postgres import postgres_client
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +43,229 @@ _RETRIEVAL_APIS = {
 }
 
 
-def _build_judge(provider: Optional[str] = None, model: Optional[str] = None) -> LLMJudge:
-    judge = LLMJudge(
-        provider=provider or config.JUDGE_PROVIDER,
-        model=model or config.JUDGE_MODEL,
-    )
-    if _judge_cache_backend is None:
-        return judge
+class BYOKUnavailable(RuntimeError):
+    """An org has a provider credential on file, but it cannot be used.
 
+    Raised instead of quietly building a judge on Fluiq's managed key. Falling
+    back would bill us for usage the customer was sold as bring-your-own-key,
+    and would hide a broken credential from the person who has to rotate it.
+    """
+
+
+class OrgCredentials:
+    """BYOK state for one org, resolved once and reused for the whole message.
+
+    Resolving per judge call would mean a Postgres round trip (and a KMS
+    unwrap) per juror. A jury of three across three metrics would pay that nine
+    times for one eval.
+    """
+
+    __slots__ = ("_org_id", "_rows", "_unsealed", "_known", "_loop", "_reported")
+
+    def __init__(
+        self,
+        org_id: Any,
+        rows: Optional[dict],
+        loop: Optional[Any] = None,
+    ) -> None:
+        self._org_id = org_id
+        self._rows = rows or {}
+        # None from the fetch means "Postgres could not tell us", which is not
+        # the same as "this org has no keys" — see fetch_org_credentials.
+        self._known = rows is not None
+        self._unsealed: dict[str, str] = {}
+        # Judge calls run in a worker thread via asyncio.to_thread, so writing
+        # back a rejection needs the loop that owns the Postgres pool.
+        self._loop = loop
+        self._reported: set = set()
+
+    def note_auth_failure(self, provider: str, reason: str) -> None:
+        """Record that the provider rejected this org's key for ``provider``.
+
+        Called from the judge thread. Schedules the Postgres write on the
+        worker's event loop and returns immediately: the evaluation is already
+        failing, and blocking it on a database round trip helps nobody.
+        Reported once per message so a jury of three does not write three times.
+        """
+        row = self._rows.get(provider)
+        if row is None or provider in self._reported:
+            return
+        self._reported.add(provider)
+        if self._loop is None:
+            return
+        try:
+            import asyncio as _asyncio
+            _asyncio.run_coroutine_threadsafe(
+                postgres_client.mark_credential_invalid(
+                    self._org_id, row["credential_id"], reason,
+                ),
+                self._loop,
+            )
+        except Exception:  # noqa: BLE001 - never let bookkeeping break an eval
+            logger.exception(
+                "[EVALUATOR] could not schedule credential invalidation org=%s",
+                self._org_id,
+            )
+
+    @property
+    def resolved(self) -> bool:
+        return self._known
+
+    def api_key_for(self, provider: str) -> Optional[str]:
+        """Return the org's key for ``provider``, or None to use managed keys.
+
+        Raises :class:`BYOKUnavailable` when the org *has* a credential for this
+        provider that we cannot use — an unknown state must never resolve to
+        Fluiq's account.
+        """
+        row = self._rows.get(provider)
+        if row is None:
+            return None  # no BYOK for this provider → managed key, as before
+
+        if row["status"] != "active":
+            raise BYOKUnavailable(
+                f"{provider} credential is marked {row['status']}"
+            )
+
+        cached = self._unsealed.get(provider)
+        if cached is not None:
+            return cached
+
+        try:
+            plaintext = crypto.unseal(
+                crypto.SealedSecret(
+                    ciphertext=bytes(row["ciphertext"]),
+                    nonce=bytes(row["nonce"]),
+                    wrapped_dek=bytes(row["wrapped_dek"]),
+                    key_version=row["key_version"],
+                ),
+                org_id=str(self._org_id),
+            )
+        except Exception as exc:
+            # Never let the exception carry ciphertext or key material outward.
+            logger.exception(
+                "[EVALUATOR] credential unseal failed org=%s provider=%s",
+                self._org_id, provider,
+            )
+            raise BYOKUnavailable(f"{provider} credential could not be decrypted") from None
+
+        self._unsealed[provider] = plaintext
+        return plaintext
+
+
+async def resolve_org_credentials(organization_id: Any) -> OrgCredentials:
+    """Load an org's BYOK credentials once per eval message."""
+    loop = asyncio.get_running_loop()
+    if organization_id is None:
+        return OrgCredentials(None, {}, loop)
+    rows = await postgres_client.fetch_org_credentials(organization_id)
+    if rows is None:
+        logger.error(
+            "[EVALUATOR] could not read credentials org=%s; falling back to managed "
+            "keys for this message", organization_id,
+        )
+    return OrgCredentials(organization_id, rows, loop)
+
+
+def parse_judge_spec(raw: Any) -> tuple[Optional[str], Optional[str]]:
+    """Parse a ``"provider:model"`` string into ``(provider, model)``.
+
+    Returns ``(None, None)`` for anything unusable so callers fall back to the
+    server default. A caller-supplied judge is untrusted input: an unknown
+    provider would raise deep inside LLMJudge, which is a poor way to learn
+    that a dropdown sent something unexpected.
+    """
+    if not raw or not isinstance(raw, str) or ":" not in raw:
+        return (None, None)
+    provider, _, model = raw.partition(":")
+    provider = provider.strip().lower()
+    model = model.strip()
+    if provider not in JUDGE_PROVIDERS or not model:
+        logger.warning("[EVALUATOR] ignoring unusable judge spec %r", raw)
+        return (None, None)
+    return (provider, model)
+
+
+def parse_jury_specs(raw: Any) -> list[tuple[str, str]]:
+    """Parse a list of ``"provider:model"`` strings into member specs.
+
+    Unusable entries are dropped rather than failing the run: a jury with two
+    good members is still a jury, and the alternative is a dropdown typo
+    silently costing the customer a whole batch.
+    """
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [part for part in raw.split(",")]
+    specs: list[tuple[str, str]] = []
+    for entry in raw:
+        provider, model = parse_judge_spec(entry)
+        if provider and model:
+            specs.append((provider, model))
+    return specs
+
+
+_AUTH_ERROR_NAMES = (
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "Unauthorized",
+    "Forbidden",
+)
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """Whether a provider exception means "this key is bad".
+
+    Provider SDKs do not share a base class, so this checks the two signals
+    they do agree on: an HTTP status attribute, and a class name. Deliberately
+    conservative — a false positive would disable a working customer key, so
+    anything ambiguous is treated as a transient failure instead.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status in (401, 403):
+        return True
+    name = type(exc).__name__
+    if any(marker in name for marker in _AUTH_ERROR_NAMES):
+        return True
+    return False
+
+
+def _auth_error_reason(exc: BaseException) -> str:
+    status = getattr(exc, "status_code", None)
+    prefix = f"HTTP {status}: " if status else ""
+    # Truncated and generic: provider error bodies can echo request metadata,
+    # and this string is shown in the dashboard.
+    return f"{prefix}provider rejected the key ({type(exc).__name__})"
+
+
+def _build_judge(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    *,
+    org_id: Any = None,
+    creds: Optional[OrgCredentials] = None,
+    usage: Optional[JudgeUsage] = None,
+) -> LLMJudge:
+    """Build a judge, optionally on the org's own provider key and cache bucket.
+
+    ``org_id`` scopes the cache to one tenant. It is required to cache at all:
+    ``_judge_cache_backend`` is process-wide and shared across every org this
+    worker serves, so an unattributed entry could be served to a different org.
+    A message without an organization is malformed, so we'd rather pay for the
+    judge call than guess at the tenant.
+
+    Raises :class:`BYOKUnavailable` when the org has an unusable credential for
+    the requested provider.
+    """
+    resolved_provider = provider or config.JUDGE_PROVIDER
+    api_key = creds.api_key_for(resolved_provider) if creds is not None else None
+
+    judge = LLMJudge(
+        provider=resolved_provider,
+        model=model or config.JUDGE_MODEL,
+        api_key=api_key,
+        usage=usage,
+    )
     def _underlying(prompt: str, **_params) -> str:
         if judge.provider == "openai":
             return judge._call_openai(prompt)
@@ -47,17 +273,49 @@ def _build_judge(provider: Optional[str] = None, model: Optional[str] = None) ->
             return judge._call_anthropic(prompt)
         if judge.provider == "gemini":
             return judge._call_gemini(prompt)
-        if judge.provider == "fluiq":
-            return judge._call_fluiq(prompt)
+        if judge.provider == "moonshot":
+            return judge._call_moonshot(prompt)
         raise RuntimeError(f"Unsupported judge provider: {judge.provider}")
 
-    cache = PromptCache(
-        _underlying,
-        model=f"{judge.provider}:{judge.model}",
-        backend=_judge_cache_backend,
-        ttl=config.JUDGE_CACHE_TTL,
-    )
-    judge._judge_fn = lambda prompt: cache(prompt, temperature=judge.temperature)
+    call = _underlying
+
+    if _judge_cache_backend is not None and org_id is not None:
+        # The cache bucket is scoped to the tenant *and* to whichever credential
+        # paid for the verdict, so a cached answer can never be served across an
+        # org boundary or attributed to the wrong provider account.
+        namespace = str(org_id)
+        if api_key:
+            namespace = f"{namespace}:{crypto.fingerprint(api_key)}"
+        call = PromptCache(
+            _underlying,
+            model=f"{judge.provider}:{judge.model}",
+            backend=_judge_cache_backend,
+            ttl=config.JUDGE_CACHE_TTL,
+            namespace=namespace,
+        )
+
+    if api_key and creds is not None:
+        # A customer key the provider rejects is reported back so the dashboard
+        # stops showing it Active. Wrapped here rather than in the handlers
+        # because this is the only place that knows the call ran on BYOK.
+        inner = call
+
+        def _reporting(prompt: str, **params) -> str:
+            try:
+                return inner(prompt, **params)
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                if is_auth_error(exc):
+                    creds.note_auth_failure(
+                        resolved_provider, _auth_error_reason(exc),
+                    )
+                raise
+
+        call = _reporting
+
+    if call is _underlying:
+        return judge  # nothing wrapped — leave __call__ on the direct path
+
+    judge._judge_fn = lambda prompt: call(prompt, temperature=judge.temperature)
     return judge
 
 
@@ -77,6 +335,8 @@ def _build_evaluator(name: str, judge: LLMJudge):
         return Toxicity(judge=judge, threshold=config.JUDGE_THRESHOLD)
     if n in ("coherence","ragas.coherence"):
         return Coherence(judge=judge, threshold=config.JUDGE_THRESHOLD)
+    if n in ("completeness", "ragas.completeness"):
+        return Completeness(judge=judge, threshold=config.JUDGE_THRESHOLD)
     if n in ("vision_faithfulness", "vision", "vision.faithfulness"):
         from jobs.helper.vision import VisionFaithfulness
         return VisionFaithfulness(judge=judge, threshold=config.JUDGE_THRESHOLD)
@@ -137,6 +397,135 @@ def _extract_contexts(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _stringify_grounding(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    try:
+        return json.dumps(v, ensure_ascii=False)[:2000]
+    except Exception:
+        return str(v)[:2000]
+
+
+def _fmt_grounding(name: Any, tool_input: Any, output: Any) -> Optional[str]:
+    """One grounding block: 'Tool "name" (input: …) returned:\\n<output>'.
+
+    The input is included when known so the judge can tie a result to its request
+    (e.g. get_weather(city=Paris) → 18°C), which a bare output may not make
+    explicit. Returns None when there is no output to ground against.
+    """
+    out = _stringify_grounding(output)
+    if not out:
+        return None
+    head = f'Tool "{name or "tool"}"'
+    inp = _stringify_grounding(tool_input)
+    if inp:
+        head += f" (input: {inp})"
+    return f"{head} returned:\n{out}"
+
+
+def _extract_tool_grounding(event: Dict[str, Any]) -> List[str]:
+    """Tool + MCP results the agent retrieved, as grounding text for the judge.
+
+    Mirrors the frontend `buildToolGrounding`: without this, a trace that calls a
+    tool (or MCP server) and answers from its result looks like a hallucination
+    because the judge never sees the tool output. Reads tool call inputs + results
+    from the message history (OpenAI role:"tool" messages, Anthropic tool_result
+    blocks, Gemini function_response) and MCP results from `mcp_calls`.
+    """
+    out: List[str] = []
+
+    # Map tool-call id → (name, input args) so each result can carry its request.
+    call_info: Dict[str, tuple] = {}
+
+    def _record_calls(tcs: Any) -> None:
+        if not isinstance(tcs, list):
+            return
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+            src = fn or tc
+            cid = tc.get("id")
+            if isinstance(cid, str):
+                args = src.get("arguments", tc.get("input") if tc.get("input") is not None else tc.get("args"))
+                call_info[cid] = (src.get("name"), args)
+
+    _record_calls(event.get("tool_calls"))
+    msgs = event.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict):
+                _record_calls(m.get("tool_calls"))
+
+    # ── Tool results in message history ──
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("role") or "").lower() == "tool":
+                cid = m.get("tool_call_id")
+                cname, cinput = call_info.get(cid, (None, None)) if isinstance(cid, str) else (None, None)
+                block = _fmt_grounding(m.get("name") or cname, cinput, m.get("content"))
+                if block:
+                    out.append(block)
+                continue
+            content = m.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                        cid = blk.get("tool_use_id")
+                        cname, cinput = call_info.get(cid, (None, None)) if isinstance(cid, str) else (None, None)
+                        block = _fmt_grounding(cname, cinput, blk.get("content"))
+                        if block:
+                            out.append(block)
+    # Gemini function_response parts
+    contents = event.get("contents")
+    if isinstance(contents, list):
+        for c in contents:
+            parts = c.get("parts") if isinstance(c, dict) else None
+            if not isinstance(parts, list):
+                continue
+            for pt in parts:
+                fr = pt.get("function_response") if isinstance(pt, dict) else None
+                if isinstance(fr, dict):
+                    block = _fmt_grounding(fr.get("name"), None, fr.get("response"))
+                    if block:
+                        out.append(block)
+
+    # ── MCP results ──
+    mcp = event.get("mcp_calls")
+    if isinstance(mcp, list):
+        results_by_id: Dict[str, Any] = {}
+        for field in (mcp, event.get("mcp_results")):
+            if not isinstance(field, list):
+                continue
+            for item in field:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "mcp_tool_result"
+                    and isinstance(item.get("tool_use_id"), str)
+                ):
+                    results_by_id[item["tool_use_id"]] = item.get("content")
+        for item in mcp:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            server = item.get("server_label") or item.get("server_name")
+            label = f'{item.get("name") or "mcp"}{f" (MCP server: {server})" if server else " (MCP)"}'
+            if t == "mcp_call":
+                block = _fmt_grounding(label, item.get("arguments"), item.get("output") or item.get("error"))
+                if block:
+                    out.append(block)
+            elif t == "mcp_tool_use":
+                block = _fmt_grounding(label, item.get("input"), results_by_id.get(item.get("id")))
+                if block:
+                    out.append(block)
+
+    return out
+
+
 async def run_evaluation(message: Dict[str, Any]) -> None:
     """Explicit eval (operation='evaluate')."""
     organization_id  = message.get("organization_id")
@@ -149,7 +538,22 @@ async def run_evaluation(message: Dict[str, Any]) -> None:
         logger.warning("[EVALUATOR] Missing 'evaluator' in message; skipping")
         return
 
-    judge = _build_judge()
+    creds = await resolve_org_credentials(organization_id)
+    usage = JudgeUsage()
+    # Per-message judge selection. Falls back to the server default when absent
+    # or unparseable, so an older SDK keeps working unchanged.
+    judge_provider, judge_model = parse_judge_spec(message.get("judge"))
+    try:
+        judge = _build_judge(
+            judge_provider, judge_model,
+            org_id=organization_id, creds=creds, usage=usage,
+        )
+    except BYOKUnavailable as exc:
+        logger.error(
+            "[EVALUATOR] not evaluating org=%s trace_id=%s: %s",
+            organization_id, trace_id, exc,
+        )
+        return
 
     try:
         if evaluator_name.lower() == "ragas":
@@ -175,7 +579,7 @@ async def run_evaluation(message: Dict[str, Any]) -> None:
             return
 
         ev = _build_evaluator(evaluator_name, judge)
-        result = await asyncio.to_thread(ev.evaluate, **inputs)
+        result = await asyncio.to_thread(judge_prompts.captured_call, ev.evaluate, **inputs)
         await _persist_eval_result(
             organization_id, api_key_prefix, trace_id,
             evaluator=evaluator_name,
@@ -215,11 +619,27 @@ async def auto_evaluate_retrieval(message: Dict[str, Any]) -> None:
         )
         return
 
-    judge   = _build_judge()
+    creds = await resolve_org_credentials(organization_id)
+    usage = JudgeUsage()
+    # Per-message judge selection. Falls back to the server default when absent
+    # or unparseable, so an older SDK keeps working unchanged.
+    judge_provider, judge_model = parse_judge_spec(message.get("judge"))
+    try:
+        judge = _build_judge(
+            judge_provider, judge_model,
+            org_id=organization_id, creds=creds, usage=usage,
+        )
+    except BYOKUnavailable as exc:
+        logger.error(
+            "[EVALUATOR] not evaluating org=%s trace_id=%s: %s",
+            organization_id, trace_id, exc,
+        )
+        return
     started = time.time()
     try:
         ev = ContextPrecision(judge=judge, threshold=config.JUDGE_THRESHOLD)
         result = await asyncio.to_thread(
+            judge_prompts.captured_call,
             ev.evaluate,
             question=question,
             contexts=[c["text"] for c in contexts],
@@ -282,7 +702,49 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
         )
         return
 
-    judge = _build_judge()
+    # Dataset metric runs grade the answer against the example's expected
+    # output: reference-aware metrics (hallucination) use it directly, and
+    # faithfulness treats it as the context to be grounded in. Metrics that
+    # don't take a reference ignore the extra kwargs.
+    #
+    # Grounding for factual metrics (hallucination / faithfulness): the tool &
+    # MCP outputs this run actually retrieved, so tool-backed claims aren't
+    # flagged as unsupported. Mirrors the dashboard's Traces eval.
+    #
+    # `contexts` is always passed (may be empty) because the RAGAS evaluators
+    # (faithfulness / context_precision / context_recall) take it as a required
+    # positional arg — omitting it raises a TypeError; with none they return a
+    # graceful "no contexts provided" 0.0 instead.
+    reference = str(message.get("reference") or "").strip()
+    contexts: List[str] = _extract_tool_grounding(event)
+    # Trace-backed dataset runs pass grounding pre-extracted from all pinned spans
+    # (the worker only receives the root event), so merge that in too.
+    extra_grounding = message.get("tool_grounding")
+    if isinstance(extra_grounding, list):
+        for g in extra_grounding:
+            if isinstance(g, str) and g.strip() and g not in contexts:
+                contexts.append(g)
+    if reference:
+        # Dataset runs grade against the example's expected output too.
+        contexts.append(reference)
+    ref_kwargs: Dict[str, Any] = {"reference": reference, "contexts": contexts}
+
+    creds = await resolve_org_credentials(organization_id)
+    usage = JudgeUsage()
+    # Per-message judge selection. Falls back to the server default when absent
+    # or unparseable, so an older SDK keeps working unchanged.
+    judge_provider, judge_model = parse_judge_spec(message.get("judge"))
+    try:
+        judge = _build_judge(
+            judge_provider, judge_model,
+            org_id=organization_id, creds=creds, usage=usage,
+        )
+    except BYOKUnavailable as exc:
+        logger.error(
+            "[EVALUATOR] not evaluating org=%s trace_id=%s: %s",
+            organization_id, trace_id, exc,
+        )
+        return
 
     for metric_name in metrics:
         try:
@@ -290,7 +752,9 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
             # Pass the raw event so vision metrics can pull media refs from the
             # trace; text-only evaluators ignore the extra kwargs.
             result = await asyncio.to_thread(
+                judge_prompts.captured_call,
                 ev.evaluate, question=question, answer=answer, event=event,
+                **ref_kwargs,
             )
             await _persist_eval_result(
                 organization_id, api_key_prefix, trace_id,
@@ -313,42 +777,77 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
                 "[EVALUATOR] LLM eval failed metric=%s trace_id=%s", metric_name, trace_id,
             )
 
-    # Client-defined custom judges: resolve each slug to its saved judge template
-    # (org-scoped, kind='judge') and score the answer with it. Best-effort —
-    # missing template / PG down / judge error just skips that judge.
-    if custom_judges:
-        from db.postgres import postgres_client
-        from jobs.helper.custom_judge import CustomJudgeEvaluator
+    # Client-defined custom judges over the answer under test.
+    await _run_custom_judges(
+        custom_judges,
+        organization_id=organization_id,
+        api_key_prefix=api_key_prefix,
+        trace_id=trace_id,
+        judge=judge,
+        question=question,
+        answer=answer,
+        context=reference,
+    )
 
-        for slug, threshold in custom_judges.items():
-            template = await postgres_client.fetch_custom_judge(organization_id, slug)
-            if not template:
-                logger.info(
-                    "[EVALUATOR] custom judge %r unavailable for org=%s; skipping",
-                    slug, organization_id,
-                )
-                continue
-            try:
-                ev = CustomJudgeEvaluator(
-                    judge=judge, template=template, name=slug,
-                    threshold=float(threshold or 0.0),
-                )
-                result = await asyncio.to_thread(ev.evaluate, question=question, answer=answer)
-                await _persist_eval_result(
-                    organization_id, api_key_prefix, trace_id,
-                    evaluator="fluiq.eval",
-                    metric=slug,
-                    result=result,
-                    judge=judge,
-                )
-                logger.info(
-                    "[EVALUATOR] custom_judge %s org=%s trace_id=%s score=%.3f threshold=%.3f",
-                    slug, organization_id, trace_id, result.score, float(threshold or 0.0),
-                )
-            except Exception:
-                logger.exception(
-                    "[EVALUATOR] custom judge failed slug=%s trace_id=%s", slug, trace_id,
-                )
+
+async def _run_custom_judges(
+    custom_judges: Dict[str, Any],
+    *,
+    organization_id: Any,
+    api_key_prefix: Any,
+    trace_id: str,
+    judge: Any,
+    question: str,
+    answer: str,
+    context: str,
+    root_trace_id: Optional[str] = None,
+) -> None:
+    """Score an answer with each client-defined judge referenced by slug.
+
+    Resolves the slug to its saved judge template (org-scoped, ``kind='judge'``)
+    and persists one eval row per scorer. Shared by the single-turn and agentic
+    paths so a scorer behaves identically on both.
+
+    Best-effort per judge: a missing template, an unreachable Postgres, or a
+    judge error skips that scorer rather than failing the whole evaluation.
+    """
+    if not custom_judges:
+        return
+    from db.postgres import postgres_client
+    from jobs.helper.custom_judge import CustomJudgeEvaluator
+
+    for slug, threshold in custom_judges.items():
+        template = await postgres_client.fetch_custom_judge(organization_id, slug)
+        if not template:
+            logger.info(
+                "[EVALUATOR] custom judge %r unavailable for org=%s; skipping",
+                slug, organization_id,
+            )
+            continue
+        try:
+            ev = CustomJudgeEvaluator(
+                judge=judge, template=template, name=slug,
+                threshold=float(threshold or 0.0),
+            )
+            result = await asyncio.to_thread(
+                ev.evaluate, question=question, answer=answer, context=context,
+            )
+            await _persist_eval_result(
+                organization_id, api_key_prefix, trace_id,
+                evaluator="fluiq.eval",
+                metric=slug,
+                result=result,
+                judge=judge,
+                root_trace_id=root_trace_id,
+            )
+            logger.info(
+                "[EVALUATOR] custom_judge %s org=%s trace_id=%s score=%.3f threshold=%.3f",
+                slug, organization_id, trace_id, result.score, float(threshold or 0.0),
+            )
+        except Exception:
+            logger.exception(
+                "[EVALUATOR] custom judge failed slug=%s trace_id=%s", slug, trace_id,
+            )
 
 
 async def agent_evaluate(message: Dict[str, Any]) -> None:
@@ -388,16 +887,39 @@ async def agent_evaluate(message: Dict[str, Any]) -> None:
     depth      = (message.get("depth") or config.EVAL_AGENT_DEPTH).lower()
     panel_mode = (message.get("panel_mode") or config.EVAL_PANEL_MODE).lower()
 
-    judge = _build_judge()
+    creds = await resolve_org_credentials(organization_id)
+    usage = JudgeUsage()
+    # Per-message judge selection. Falls back to the server default when absent
+    # or unparseable, so an older SDK keeps working unchanged.
+    judge_provider, judge_model = parse_judge_spec(message.get("judge"))
+    try:
+        judge = _build_judge(
+            judge_provider, judge_model,
+            org_id=organization_id, creds=creds, usage=usage,
+        )
+    except BYOKUnavailable as exc:
+        logger.error(
+            "[EVALUATOR] not evaluating org=%s trace_id=%s: %s",
+            organization_id, trace_id, exc,
+        )
+        return
     panel = None
     if depth == "deep":
         panel = build_panel(
             primary=judge,
-            member_specs=config.panel_members(),
+            # Caller-selected jury wins; the configured panel is the fallback,
+            # so an org that does not pick one still gets the server default.
+            member_specs=parse_jury_specs(message.get("jury")) or config.panel_members(),
             mode=panel_mode,
             gate_margin=config.EVAL_PANEL_GATE_MARGIN,
             threshold=config.JUDGE_THRESHOLD,
-            judge_factory=_build_judge,
+            # build_panel calls this as judge_factory(provider, model); bind the
+            # org so jurors share the primary's tenant-scoped cache bucket, and
+            # the credential set so each juror uses the org's key for *its* own
+            # provider rather than the primary's.
+            judge_factory=functools.partial(
+                _build_judge, org_id=organization_id, creds=creds, usage=usage,
+            ),
         )
 
     outcome = await asyncio.to_thread(
@@ -455,6 +977,21 @@ async def agent_evaluate(message: Dict[str, Any]) -> None:
             run_score=run_score,
             run_passed=run_passed,
         )
+    # Custom scorers apply to agentic runs too, graded against the run's final
+    # answer with its goal as the question, so a dataset's scorers behave the
+    # same whichever evaluator it runs.
+    await _run_custom_judges(
+        (message.get("eval_config") or {}).get("custom_judges") or {},
+        organization_id=organization_id,
+        api_key_prefix=api_key_prefix,
+        trace_id=trace_id,
+        judge=judge,
+        question=run.goal or "",
+        answer=run.final_output or "",
+        context=run.goal or "",
+        root_trace_id=root_trace_id,
+    )
+
     logger.info(
         "[EVALUATOR] agent_eval trace_id=%s source=%s depth=%s calls=%d "
         "run_score=%.3f det_errors=%d metrics=%s passed=%s",
@@ -479,7 +1016,22 @@ async def playground_eval(message: Dict[str, Any]) -> None:
     metrics         = message.get("metrics") or ["hallucination", "relevance"]
     thresholds      = message.get("thresholds") or {}
 
-    judge = _build_judge()
+    creds = await resolve_org_credentials(organization_id)
+    usage = JudgeUsage()
+    # Per-message judge selection. Falls back to the server default when absent
+    # or unparseable, so an older SDK keeps working unchanged.
+    judge_provider, judge_model = parse_judge_spec(message.get("judge"))
+    try:
+        judge = _build_judge(
+            judge_provider, judge_model,
+            org_id=organization_id, creds=creds, usage=usage,
+        )
+    except BYOKUnavailable as exc:
+        logger.error(
+            "[EVALUATOR] not evaluating org=%s trace_id=%s: %s",
+            organization_id, trace_id, exc,
+        )
+        return
 
     results_list: List[Dict[str, Any]] = []
     scores:       Dict[str, float]     = {}
@@ -491,7 +1043,7 @@ async def playground_eval(message: Dict[str, Any]) -> None:
             kwargs: Dict[str, Any] = {"question": prompt, "answer": response}
             if ctx:
                 kwargs["context"] = ctx
-            result = await asyncio.to_thread(ev.evaluate, **kwargs)
+            result = await asyncio.to_thread(judge_prompts.captured_call, ev.evaluate, **kwargs)
             score     = float(result.score)
             threshold = float(thresholds.get(metric_name, 0.0))
             passed    = score >= threshold if threshold > 0 else True
@@ -548,6 +1100,110 @@ async def playground_eval(message: Dict[str, Any]) -> None:
         )
 
 
+async def propose_scorers(message: Dict[str, Any]) -> None:
+    """Draft custom LLM-as-judge scorers for a dataset from a sample of its
+    examples — the 'eval engineering' step: given real data, suggest what's worth
+    scoring. The API publishes this with a ``correlation_id`` and awaits the
+    reply on ``KAFKA_PLAYGROUND_REPLY_TOPIC`` (the same channel playground uses).
+
+    Best-effort: any failure replies with an empty proposal list plus a reason,
+    so the caller shows a clean 'couldn't suggest' rather than hanging.
+    """
+    correlation_id  = message.get("correlation_id")
+    organization_id = message.get("organization_id")
+    examples        = message.get("examples") or []
+    count           = max(1, min(6, int(message.get("count") or 4)))
+    existing        = [str(n) for n in (message.get("existing") or []) if n]
+
+    async def _reply(result: Dict[str, Any]) -> None:
+        if not correlation_id:
+            return
+        try:
+            await kafka_producer.publish(
+                {"correlation_id": correlation_id, "result": result},
+                topic=config.KAFKA_PLAYGROUND_REPLY_TOPIC,
+                key=str(organization_id) if organization_id is not None else None,
+            )
+        except Exception:
+            logger.exception(
+                "[EVALUATOR] Failed to publish propose_scorers reply cid=%s", correlation_id,
+            )
+
+    creds = await resolve_org_credentials(organization_id)
+    usage = JudgeUsage()
+    judge_provider, judge_model = parse_judge_spec(message.get("judge"))
+    try:
+        judge = _build_judge(
+            judge_provider, judge_model,
+            org_id=organization_id, creds=creds, usage=usage,
+        )
+    except BYOKUnavailable as exc:
+        await _reply({"proposals": [], "error": str(exc)})
+        return
+
+    sample_parts: List[str] = []
+    for ex in examples[:12]:
+        inp = str(ex.get("input") or "")[:600]
+        out = str(ex.get("expected_output") or "")[:600]
+        sample_parts.append(f"INPUT: {inp}\nEXPECTED OUTPUT: {out}")
+    sample_block = "\n\n---\n\n".join(sample_parts) or "(no examples provided)"
+
+    # Built by concatenation, not .format/f-string, so the literal JSON braces
+    # and the {{answer}} placeholder we want the model to emit survive verbatim.
+    meta = (
+        "You are an eval engineer. From a sample of a dataset's INPUT / EXPECTED "
+        "OUTPUT pairs, propose " + str(count) + " DISTINCT custom LLM-as-judge "
+        "scorers. Each scorer checks ONE important, specific quality dimension "
+        "the data suggests matters — for example: adherence to the expected "
+        "format, faithfulness to the expected output, required fields present, "
+        "tone, or safety. Make them concrete to THIS data, not generic. "
+        "Do not duplicate these existing scorers: " + (", ".join(existing) or "none") + ". "
+        "Every scorer's prompt MUST reference the {{answer}} placeholder (the "
+        "output under test); it may also use {{question}} and {{context}}; and it "
+        "MUST tell the model to return ONLY a JSON object "
+        '{"score": <float 0..1>, "reason": "<short>"}. '
+        "Return ONLY a JSON object: "
+        '{"proposals": [{"name": "<short title>", "description": "<one line>", '
+        '"prompt": "<the judge prompt>", "threshold": <float 0..1 pass cutoff>}]}.'
+        "\n\nDATASET SAMPLE:\n" + sample_block
+    )
+
+    try:
+        data = await asyncio.to_thread(judge.judge_json, meta)
+    except Exception:
+        logger.exception("[EVALUATOR] propose_scorers judge call failed cid=%s", correlation_id)
+        await _reply({"proposals": [], "error": "The judge call failed."})
+        return
+
+    raw = data.get("proposals") if isinstance(data, dict) else None
+    proposals: List[Dict[str, Any]] = []
+    for p in (raw or [])[:count]:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        prompt = str(p.get("prompt") or "")
+        # Drop anything the API would reject anyway (no answer placeholder).
+        if not name or ("{{answer}}" not in prompt and "$answer" not in prompt):
+            continue
+        try:
+            threshold = float(p.get("threshold"))
+        except (TypeError, ValueError):
+            threshold = 0.5
+        threshold = min(1.0, max(0.0, threshold))
+        proposals.append({
+            "name":        name[:120],
+            "description": str(p.get("description") or "")[:300],
+            "prompt":      prompt,
+            "threshold":   threshold,
+        })
+
+    logger.info(
+        "[EVALUATOR] propose_scorers org=%s cid=%s proposed=%d",
+        organization_id, correlation_id, len(proposals),
+    )
+    await _reply({"proposals": proposals})
+
+
 async def _persist_eval_result(
     organization_id: Any,
     api_key_prefix: Any,
@@ -565,8 +1221,18 @@ async def _persist_eval_result(
     run_passed: bool = True,
 ) -> None:
     details = details_override if details_override is not None else result.model_dump(mode="json")
+    # Prompt provenance is attached to the evaluator's own details; lift it to
+    # the top level of the CH details column so the dashboard reads it flat.
+    nested = details.get("details")
+    if "judge_prompts" not in details and isinstance(nested, dict) and nested.get("judge_prompts"):
+        details["judge_prompts"] = nested.pop("judge_prompts")
     details.setdefault("judge_provider", judge.provider)
     score = float(result.score)
+    # Drained, not read: one message can persist several metric rows, and the
+    # judge spend belongs to the message as a whole (a jury's calls are not
+    # divisible per metric). The first row carries the totals and later rows
+    # carry zeros, so SUM over rows is the true spend rather than a multiple.
+    judge_in, judge_out, judge_calls = judge.usage.drain()
     record = {
         "organization_id": organization_id,
         "api_key_prefix":  api_key_prefix,
@@ -576,6 +1242,9 @@ async def _persist_eval_result(
         "metric":          metric,
         "score":           score,
         "judge_model":     judge.model,
+        "judge_input_tokens":  judge_in,
+        "judge_output_tokens": judge_out,
+        "judge_calls":         judge_calls,
         "details":         details,
         "layer":           layer,
         "step_id":         step_id,

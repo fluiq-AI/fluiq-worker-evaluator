@@ -18,6 +18,7 @@ from jobs.agentic.panel import JudgePanel
 from jobs.agentic.schema import AgentRun
 from jobs.agentic.tool_selection import ToolSelectionQuality
 from jobs.agentic.trajectory import TrajectoryEvaluator
+from jobs.helper import judge_prompts
 from jobs.helper.base import EvalResult
 from jobs.helper.judge import LLMJudge
 
@@ -68,9 +69,13 @@ def evaluate_run(
             deterministic=det_report,
         )
         if use_panel:
-            metrics[ToolSelectionQuality.name] = panel.evaluate(_build_tsq, tsq_kwargs)
+            metrics[ToolSelectionQuality.name] = judge_prompts.captured_call(
+                panel.evaluate, _build_tsq, tsq_kwargs,
+            )
         else:
-            metrics[ToolSelectionQuality.name] = _build_tsq(judge).evaluate(**tsq_kwargs)
+            metrics[ToolSelectionQuality.name] = judge_prompts.captured_call(
+                _build_tsq(judge).evaluate, **tsq_kwargs,
+            )
 
     # ── L3: trajectory (standard + deep) ──────────────────────────────────
     if depth in ("standard", "deep"):
@@ -81,9 +86,13 @@ def evaluate_run(
             goal=run.goal, steps=run.steps, final_output=run.final_output, graph=graph,
         )
         if use_panel:
-            metrics[TrajectoryEvaluator.name] = panel.evaluate(_build_traj, traj_kwargs)
+            metrics[TrajectoryEvaluator.name] = judge_prompts.captured_call(
+                panel.evaluate, _build_traj, traj_kwargs,
+            )
         else:
-            metrics[TrajectoryEvaluator.name] = _build_traj(judge).evaluate(**traj_kwargs)
+            metrics[TrajectoryEvaluator.name] = judge_prompts.captured_call(
+                _build_traj(judge).evaluate, **traj_kwargs,
+            )
 
     # ── L5: multi-agent coordination (only for genuine multi-agent runs) ───
     if depth in ("standard", "deep"):
@@ -96,9 +105,13 @@ def evaluate_run(
 
             coord_kwargs = dict(run=run, graph=graph)
             if use_panel:
-                metrics[MultiAgentEvaluator.name] = panel.evaluate(_build_coord, coord_kwargs)
+                metrics[MultiAgentEvaluator.name] = judge_prompts.captured_call(
+                    panel.evaluate, _build_coord, coord_kwargs,
+                )
             else:
-                metrics[MultiAgentEvaluator.name] = _build_coord(judge).evaluate(**coord_kwargs)
+                metrics[MultiAgentEvaluator.name] = judge_prompts.captured_call(
+                    _build_coord(judge).evaluate, **coord_kwargs,
+                )
 
     # ── run-level verdict ─────────────────────────────────────────────────
     metric_scores = [m.score for m in metrics.values()]

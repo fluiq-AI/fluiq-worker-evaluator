@@ -8,6 +8,7 @@ so evaluations never break because of this table.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import asyncpg
@@ -84,18 +85,116 @@ class PostgresClient:
             logger.exception("[EVALUATOR][PG] custom judge fetch failed slug=%s", slug)
             return None
 
+    async def fetch_org_credentials(
+        self, organization_id: Any,
+    ) -> Optional[dict[str, dict[str, Any]]]:
+        """Return this org's provider credentials keyed by provider, or None.
+
+        The return value is deliberately three-valued, because "this org has no
+        BYOK key" and "we could not find out" must not be treated the same way:
+
+            ``{...}``  rows found (may include non-active ones — the caller
+                       decides, because an invalid key must stop the eval
+                       rather than silently fall back to Fluiq's account)
+            ``{}``     the org definitively has no credentials → managed keys
+            ``None``   Postgres is unreachable or the table is missing → we
+                       cannot tell, so the caller falls back to managed keys
+                       and logs it
+
+        That last case is the one deliberate fail-open here: a Postgres blip
+        should not stop every eval in the fleet. The cost is that Fluiq briefly
+        absorbs token spend for BYOK orgs, which is bounded and noisy in the
+        logs rather than silent.
+
+        Returns sealed rows, not plaintext — decryption is the caller's job so
+        this layer never handles key material.
+        """
+        if self._pool is None:
+            return None
+        table = os.getenv("POSTGRES_CREDENTIALS_TABLE", "org_provider_credentials")
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"SELECT credential_id, provider, status, ciphertext, nonce, "
+                    f"wrapped_dek, key_version FROM {table} WHERE org_id = $1::uuid",
+                    str(organization_id),
+                )
+        except asyncpg.UndefinedTableError:
+            # BYOK not deployed yet on this environment — that is "no
+            # credentials", not "unknown".
+            return {}
+        except Exception:
+            logger.exception(
+                "[EVALUATOR][PG] credential fetch failed org=%s", organization_id,
+            )
+            return None
+        return {r["provider"]: dict(r) for r in rows}
+
+    async def mark_credential_invalid(
+        self, organization_id: Any, credential_id: Any, error: str,
+    ) -> None:
+        """Flag a BYOK credential the provider rejected at eval time.
+
+        Without this, a key revoked upstream fails every evaluation while the
+        dashboard still shows it Active — the customer has no way to learn that
+        the thing to fix is their key. Deliberately does not delete the row:
+        they need to see *which* key broke in order to rotate it.
+        """
+        if self._pool is None:
+            return
+        table = os.getenv("POSTGRES_CREDENTIALS_TABLE", "org_provider_credentials")
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE {table} SET status = 'invalid', last_error = $3, "
+                    f"updated_at = NOW() "
+                    f"WHERE org_id = $1::uuid AND credential_id = $2::uuid "
+                    f"  AND status = 'active'",
+                    str(organization_id), str(credential_id), (error or "")[:500],
+                )
+            logger.warning(
+                "[EVALUATOR][PG] credential marked invalid org=%s credential=%s",
+                organization_id, credential_id,
+            )
+        except Exception:
+            logger.exception(
+                "[EVALUATOR][PG] could not mark credential invalid org=%s", organization_id,
+            )
+
     async def fetch_judge_prompts(self) -> list[dict[str, Any]]:
-        """Return [{name, template, required_vars}] or [] when unavailable."""
+        """Return [{name, template, required_vars, version, is_overridden}] or []."""
         if self._pool is None:
             return []
         try:
             async with self._pool.acquire() as conn:
                 records = await conn.fetch(
-                    "SELECT name, template, required_vars FROM eval_judge_prompts"
+                    "SELECT name, template, required_vars, version, is_overridden "
+                    "FROM eval_judge_prompts"
                 )
             return [dict(r) for r in records]
         except Exception:
             logger.exception("[EVALUATOR][PG] fetch failed; using cached/default prompts")
+            return []
+
+    async def fetch_org_judge_prompts(self) -> list[dict[str, Any]]:
+        """Return per-org judge-prompt overrides, or [] when unavailable.
+
+        The table ships with a later API deploy than this worker may be running
+        against, so a missing relation is expected and stays quiet.
+        """
+        if self._pool is None:
+            return []
+        try:
+            async with self._pool.acquire() as conn:
+                records = await conn.fetch(
+                    "SELECT org_id::text AS org_id, name, template, version "
+                    "FROM eval_judge_prompt_org_overrides"
+                )
+            return [dict(r) for r in records]
+        except asyncpg.UndefinedTableError:
+            return []
+        except Exception:
+            logger.exception("[EVALUATOR][PG] org-override fetch failed; using cached prompts")
             return []
 
 

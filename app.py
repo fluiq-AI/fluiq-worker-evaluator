@@ -16,6 +16,7 @@ from jobs.run import (
     auto_evaluate_retrieval,
     auto_llm_eval,
     playground_eval,
+    propose_scorers,
     run_evaluation,
 )
 
@@ -88,6 +89,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[None]]] = {
     "auto":                  auto_evaluate_retrieval,
     "sdk_llm":               auto_llm_eval,
     "playground_eval":       playground_eval,
+    "propose_scorers":       propose_scorers,
     "agent_eval":            agent_evaluate,
 }
 
@@ -130,7 +132,19 @@ async def dispatch(message: dict[str, Any]) -> None:
     # TTL-gated and best-effort, so this is a cheap no-op on most messages and
     # never blocks evaluation if Postgres is slow or unset.
     await judge_prompts.refresh()
-    await handler(message)
+    # Select this message's org so per-org prompt overrides resolve during
+    # rendering. Safe as a per-message global: messages are processed serially.
+    judge_prompts.set_org(message.get("organization_id"))
+    # Per-run prompt overrides ride on the job itself (a dataset's own metric
+    # prompts), and outrank the org/platform layers for this message only.
+    judge_prompts.set_run_overrides(
+        (message.get("eval_config") or {}).get("judge_prompt_overrides")
+    )
+    try:
+        await handler(message)
+    finally:
+        judge_prompts.set_org(None)
+        judge_prompts.set_run_overrides(None)
 
 
 async def consume() -> None:
