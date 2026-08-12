@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from jobs.helper import judge_prompts
-from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit
+from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, judge_score
 from jobs.helper.judge import LLMJudge
 
 _MAX_IMAGES = 6  # cap images per judge call
@@ -253,7 +253,7 @@ class _MediaGroundedBase(BaseEvaluator):
             answer=answer,
         )
         data = self.judge.judge_multimodal_json(prompt, items)
-        score = _clamp_unit(data.get("score"))
+        score = judge_score(data)
         return self._result(
             score, str(data.get("reason") or ""),
             {"applicable": True, "media": len(items), "by_kind": by_kind,

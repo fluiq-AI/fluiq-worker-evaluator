@@ -76,3 +76,44 @@ def _clamp_unit(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, f))
+
+
+# ── Discrete judge scale ─────────────────────────────────────────────────────
+#
+# Judges rate on an integer 1..5 against a written rubric line per point, and
+# the mapping to 0..1 happens here rather than in the model. Picking one of five
+# labelled options is a classification task an LLM does reliably; emitting a
+# calibrated real number is not. This is the Prometheus / MT-Bench convention —
+# essentially every published judge uses a discrete scale — and it removes the
+# score clustering that a free 0..1 float produces around the pass threshold.
+LIKERT_MAX = 5
+
+
+def likert_to_unit(rating: Any, default: float = 0.0) -> float:
+    """Map an integer rating on 1..LIKERT_MAX onto 0..1.
+
+    1 -> 0.00, 2 -> 0.25, 3 -> 0.50, 4 -> 0.75, 5 -> 1.00.
+    """
+    try:
+        r = float(rating)
+    except (TypeError, ValueError):
+        return default
+    r = max(1.0, min(float(LIKERT_MAX), r))
+    return (r - 1.0) / (LIKERT_MAX - 1.0)
+
+
+def judge_score(data: Dict[str, Any], default: float = 0.0, key: str = "rating") -> float:
+    """Read a judge's verdict as 0..1, accepting both scales.
+
+    Prefers the discrete ``rating`` the shipped prompts now ask for, and falls
+    back to a raw 0..1 ``score``. The fallback is not politeness — an org that
+    edited its prompt before the switch keeps that template forever, because
+    the seeder never overwrites a row with ``is_overridden`` set. Those judges
+    still answer with ``score``, and dropping the fallback would silently zero
+    every one of them.
+    """
+    if data.get(key) is not None:
+        return likert_to_unit(data.get(key), default=default)
+    if data.get("score") is not None:
+        return _clamp_unit(data.get("score"), default=default)
+    return default

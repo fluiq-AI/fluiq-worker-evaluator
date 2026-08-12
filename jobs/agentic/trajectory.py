@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from jobs.agentic.graph import AgentGraph
 from jobs.agentic.schema import AgentRun, AgentStep
 from jobs.helper import judge_prompts
-from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit
+from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, judge_score
 from jobs.helper.judge import LLMJudge
 
 
@@ -92,13 +92,17 @@ class TrajectoryEvaluator(BaseEvaluator):
         data = self.judge.judge_json(prompt)
 
         completion = _clamp_unit(data.get("goal_completion"), default=None) if data.get("goal_completion") is not None else None
-        efficiency = _clamp_unit(data.get("efficiency"), default=None) if data.get("efficiency") is not None else None
+        efficiency = (
+            judge_score(data, key="efficiency_rating")
+            if data.get("efficiency_rating") is not None
+            else (_clamp_unit(data.get("efficiency")) if data.get("efficiency") is not None else None)
+        )
 
         # Overall score: prefer explicit; else blend completion (weighted) with
         # efficiency. Completion dominates — an efficient run that fails the goal
         # is still a failure.
-        if data.get("score") is not None:
-            score = _clamp_unit(data.get("score"))
+        if data.get("rating") is not None or data.get("score") is not None:
+            score = judge_score(data)
         elif completion is not None:
             score = _clamp_unit(0.75 * completion + 0.25 * (efficiency if efficiency is not None else completion))
         else:

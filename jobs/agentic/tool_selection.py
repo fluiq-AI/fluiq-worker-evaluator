@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from jobs.agentic.deterministic import DeterministicReport
 from jobs.agentic.schema import AgentRun, ToolCall, ToolSpec
 from jobs.helper import judge_prompts
-from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit
+from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, judge_score
 from jobs.helper.judge import LLMJudge
 
 
@@ -94,8 +94,8 @@ class ToolSelectionQuality(BaseEvaluator):
                 })
 
         # Prefer an explicit overall score; else derive from per-call verdicts.
-        if data.get("score") is not None:
-            score = _clamp_unit(data.get("score"))
+        if data.get("rating") is not None or data.get("score") is not None:
+            score = judge_score(data)
         elif per_call:
             score = _clamp_unit(
                 sum(1 for c in per_call if c["appropriate"]) / len(per_call)

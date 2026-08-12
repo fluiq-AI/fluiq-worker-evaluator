@@ -1,7 +1,7 @@
 from typing import Any, List, Optional
 
 from jobs.helper import judge_prompts
-from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, _coerce_contexts
+from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, _coerce_contexts, judge_score
 from jobs.helper.judge import LLMJudge
 
 
@@ -28,7 +28,7 @@ class HallucinationEvaluator(BaseEvaluator):
                     question_block=judge_prompts.question_block(question),
                 )
             )
-            score = _clamp_unit(data.get("score"), default=0.5)
+            score = judge_score(data, default=0.5)
             return self._result(score, str(data.get("reason") or ""), data)
 
         claims = self._extract_claims(answer)

@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 
 from jobs.helper import judge_prompts
-from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, _coerce_contexts
+from jobs.helper.base import BaseEvaluator, EvalResult, _clamp_unit, _coerce_contexts, judge_score
 from jobs.helper.judge import LLMJudge
 
 class Faithfulness(BaseEvaluator):
@@ -62,7 +62,7 @@ class AnswerRelevancy(BaseEvaluator):
         data = self.judge.judge_json(
             judge_prompts.render("answer_relevancy", question=question, answer=answer)
         )
-        score = _clamp_unit(data.get("score"))
+        score = judge_score(data)
         if data.get("noncommittal") is True:
             score = 0.0
         return self._result(score, str(data.get("reason") or ""), data)
@@ -170,8 +170,12 @@ class Toxicity(BaseEvaluator):
         )
 
         toxic = bool(data.get("toxic"))
-        severity = float(data.get("severity", 0.0))
-        severity = _clamp_unit(severity)
+        # "severity_rating" 1..5 (1 = nothing objectionable) is the new
+        # scale; "severity" is the legacy 0..1 float an overridden prompt
+        # may still return.
+        severity = judge_score(data, key="severity_rating")
+        if data.get("severity_rating") is None and data.get("severity") is not None:
+            severity = _clamp_unit(data.get("severity"))
 
         # Convert toxicity severity into a safety score
         score = 1.0 - severity if toxic else 1.0
@@ -212,13 +216,14 @@ class Coherence(BaseEvaluator):
             )
         )
 
-        score = _clamp_unit(float(data.get("score", 0.0)))
+        score = judge_score(data)
 
         return self._result(
             score,
             data.get("reason", "coherence evaluation completed"),
             {
                 "raw_score": score,
+                "defects": data.get("defects") if isinstance(data.get("defects"), list) else [],
             },
         )
 
@@ -248,7 +253,7 @@ class Completeness(BaseEvaluator):
             )
         )
 
-        score = _clamp_unit(float(data.get("score", 0.0)))
+        score = judge_score(data)
         missing = data.get("missing")
 
         return self._result(
