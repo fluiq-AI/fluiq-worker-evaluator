@@ -43,7 +43,20 @@ class PostgresClient:
             self._pool = None
 
     async def seed_judge_prompts(self, rows: list[dict[str, Any]]) -> None:
-        """Insert canonical defaults, never clobbering an existing (edited) row."""
+        """Seed canonical defaults, refreshing them without clobbering edits.
+
+        ``DO NOTHING`` was wrong here: once a row existed, every later
+        improvement to the shipped prompt was inert in production, because the
+        row is only ever written on first boot. The API's own seeder
+        (``db_queues/postgresql/eval_prompts.py``) already had the correct
+        semantics; this mirrors them so the two agree:
+
+        - ``default_template`` always tracks the code default, so "reset to
+          platform default" in Admin restores the *current* prompt, not the one
+          that happened to be shipping the day the row was created.
+        - ``template`` moves with it only while ``is_overridden`` is false. An
+          org that edited its prompt keeps that edit untouched.
+        """
         if self._pool is None:
             return
         try:
@@ -53,7 +66,21 @@ class PostgresClient:
                     INSERT INTO eval_judge_prompts
                         (name, template, default_template, description, required_vars)
                     VALUES ($1, $2, $2, $3, $4::jsonb)
-                    ON CONFLICT (name) DO NOTHING
+                    ON CONFLICT (name) DO UPDATE SET
+                        default_template = EXCLUDED.default_template,
+                        description      = EXCLUDED.description,
+                        required_vars    = EXCLUDED.required_vars,
+                        template = CASE
+                            WHEN eval_judge_prompts.is_overridden
+                            THEN eval_judge_prompts.template
+                            ELSE EXCLUDED.template
+                        END
+                    WHERE eval_judge_prompts.default_template
+                              IS DISTINCT FROM EXCLUDED.default_template
+                       OR eval_judge_prompts.description
+                              IS DISTINCT FROM EXCLUDED.description
+                       OR eval_judge_prompts.required_vars
+                              IS DISTINCT FROM EXCLUDED.required_vars
                     """,
                     [
                         (r["name"], r["template"], r.get("description"), r["required_vars"])
