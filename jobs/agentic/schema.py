@@ -43,9 +43,35 @@ class ToolCall(BaseModel):
     raw: Optional[Dict[str, Any]] = None
 
 
+class RetrievedDoc(BaseModel):
+    """One document returned by a retriever, in the order the retriever ranked it."""
+
+    model_config = ConfigDict(extra="allow")
+
+    rank: int = 0              # 0-based position as returned; this is what nDCG grades
+    id: Optional[str] = None
+    text: str = ""
+    score: Optional[float] = None   # the store's own similarity/distance, when given
+
+
+class Retrieval(BaseModel):
+    """A single retrieval step: the query that went in and the ranked docs that
+    came back. Ranking is preserved because *order* is half of what we grade —
+    returning the right documents in the wrong order is a real, separate defect
+    from returning the wrong documents."""
+
+    model_config = ConfigDict(extra="allow")
+
+    query: str = ""
+    docs: List[RetrievedDoc] = Field(default_factory=list)
+    integration: Optional[str] = None   # "pinecone" | "chromadb" | ...
+    target: Optional[str] = None        # index / collection name
+    top_k: Optional[int] = None
+
+
 class AgentStep(BaseModel):
-    """One step of a run. For the vertical slice this is an LLM turn that
-    emitted zero or more tool calls; retrieval/other step types slot in later.
+    """One step of a run: an LLM turn that emitted zero or more tool calls, or a
+    retrieval step carrying its ranked results.
 
     ``parent_id`` is the single causal parent the SDK records. ``parent_ids``
     carries the *multiple* parents of a DAG join / fan-in node (e.g. a
@@ -64,6 +90,8 @@ class AgentStep(BaseModel):
     parent_id: Optional[str] = None
     parent_ids: List[str] = Field(default_factory=list)
     tool_calls: List[ToolCall] = Field(default_factory=list)
+    # Present only on retrieval steps (``type == "retrieval"``).
+    retrieval: Optional["Retrieval"] = None
 
     def parents(self) -> List[str]:
         """Effective parents: the explicit multi-parent list if present, else
@@ -93,6 +121,11 @@ class AgentRun(BaseModel):
         for step in self.steps:
             calls.extend(step.tool_calls)
         return calls
+
+    @property
+    def retrievals(self) -> List["Retrieval"]:
+        """Every retrieval step's payload, in run order."""
+        return [s.retrieval for s in self.steps if s.retrieval is not None]
 
     def tool_spec(self, name: str) -> Optional[ToolSpec]:
         for spec in self.available_tools:

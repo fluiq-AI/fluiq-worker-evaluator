@@ -17,6 +17,7 @@ from jobs.agentic.graph import build_graph
 from jobs.agentic.panel import JudgePanel
 from jobs.agentic.schema import AgentRun
 from jobs.agentic.tool_selection import ToolSelectionQuality
+from jobs.agentic.retrieval import RetrievalQuality
 from jobs.agentic.trajectory import TrajectoryEvaluator
 from jobs.helper import judge_prompts
 from jobs.helper.base import EvalResult
@@ -25,6 +26,7 @@ from jobs.helper.judge import LLMJudge
 # Which layer each metric belongs to (persisted on the CH ``layer`` column).
 METRIC_LAYER: Dict[str, str] = {
     ToolSelectionQuality.name: "tool_selection",
+    RetrievalQuality.name:     "retrieval",
     TrajectoryEvaluator.name:  "trajectory",
     MultiAgentEvaluator.name:  "coordination",
 }
@@ -77,6 +79,30 @@ def evaluate_run(
                 _build_tsq(judge).evaluate, **tsq_kwargs,
             )
 
+    # ── L2.5: retrieval & ranking ─────────────────────────────────────────
+    # Runs at every depth, including "fast": a retriever that returned the wrong
+    # documents invalidates everything downstream of it, so this is not a
+    # refinement you defer to a deeper tier. Skipped entirely when the run did
+    # no retrieval, which keeps non-RAG runs from paying for a judge call.
+    retrievals = run.retrievals
+    if retrievals:
+        def _build_rq(j: LLMJudge) -> RetrievalQuality:
+            return RetrievalQuality(judge=j, threshold=threshold)
+
+        rq_kwargs = dict(
+            retrievals=retrievals,
+            goal=run.goal,
+            final_output=run.final_output,
+        )
+        if use_panel:
+            metrics[RetrievalQuality.name] = judge_prompts.captured_call(
+                panel.evaluate, _build_rq, rq_kwargs,
+            )
+        else:
+            metrics[RetrievalQuality.name] = judge_prompts.captured_call(
+                _build_rq(judge).evaluate, **rq_kwargs,
+            )
+
     # ── L3: trajectory (standard + deep) ──────────────────────────────────
     if depth in ("standard", "deep"):
         def _build_traj(j: LLMJudge) -> TrajectoryEvaluator:
@@ -124,6 +150,7 @@ def evaluate_run(
         "integration": run.integration,
         "depth": depth,
         "tool_call_count": len(run.tool_calls),
+        "retrieval_count": len(run.retrievals),
         "deterministic": det_report.model_dump(mode="json"),
         "metrics": metrics,
         "metric_layers": {name: METRIC_LAYER.get(name, "") for name in metrics},

@@ -196,6 +196,13 @@ _PROMPTS: Dict[str, Dict[str, Any]] = {
             "DETERMINISTIC_FLAGS:\n{{flags}}"
         ),
     },
+    "retrieval_quality": {
+        "description": "Agentic - grade each retrieved document's relevance to the query on a graded scale, and whether the final answer used them.",
+        "required": ["query", "documents"],
+        "template": (
+            "Today's date {{today}}. You are grading a RETRIEVAL step from a RAG or agentic pipeline. You are given the QUERY that was issued, the DOCUMENTS the retriever returned in the exact order it ranked them, and the agent's final ANSWER.\n\nGrade EVERY document on this scale:\n  0 = irrelevant; does not help answer the query at all\n  1 = marginal; same topic but does not address the query\n  2 = relevant; contributes part of an answer\n  3 = fully relevant; directly answers the query\n\nGrade each document ON ITS OWN MERITS. Do NOT reward a document for appearing early or punish it for appearing late - the position is graded separately from your labels. Return exactly one grade per document, in the order given.\n\nThen decide ANSWER_USES_DOCUMENTS: true if the final ANSWER is drawn from the retrieved documents, false if it ignored them or contradicts them. Use null when no answer was captured.\n\nReturn JSON: {\"grades\": [int 0..{{max_grade}}] (one per document, in order), \"answer_uses_documents\": bool|null, \"reason\": str}.\n\nQUERY:\n{{query}}\n\nDOCUMENTS (in retriever rank order):\n{{documents}}\n\nANSWER:\n{{answer}}"
+        ),
+    },
     "trajectory_quality": {
         "description": "Agentic — judge whether the run's whole trajectory achieved the goal, efficiently and coherently.",
         "required": ["goal", "trajectory"],

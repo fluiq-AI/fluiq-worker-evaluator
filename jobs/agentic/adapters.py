@@ -19,7 +19,14 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from jobs.agentic.schema import AgentRun, AgentStep, ToolCall, ToolSpec
+from jobs.agentic.schema import (
+    AgentRun,
+    AgentStep,
+    Retrieval,
+    RetrievedDoc,
+    ToolCall,
+    ToolSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +287,88 @@ def _tool_calls_from_event(event: Dict[str, Any]) -> List[ToolCall]:
     return calls
 
 
+# ── Retrieval normalization ──────────────────────────────────────────────────
+
+# Vector-store spans carry the query under ``query`` and the ranked results
+# under ``result.matches.items``; the SDK's emit_vector_trace builds both. Rank
+# is positional: the store returned them in relevance order, and preserving that
+# order is the whole point, because ranking is graded separately from relevance.
+
+_RETRIEVAL_TYPES = {"vectorstore", "retrieval", "retriever"}
+
+
+def _retrieval_query(event: Dict[str, Any]) -> str:
+    query = event.get("query")
+    if isinstance(query, str):
+        return query
+    if not isinstance(query, dict):
+        return ""
+    texts = query.get("texts")
+    if isinstance(texts, list) and texts:
+        return "\n".join(str(t) for t in texts if t)
+    for key in ("text", "question", "query"):
+        val = query.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
+def _retrieval_docs(event: Dict[str, Any]) -> List[RetrievedDoc]:
+    result = event.get("result")
+    matches = result.get("matches") if isinstance(result, dict) else None
+    items = matches.get("items") if isinstance(matches, dict) else None
+    if not isinstance(items, list):
+        return []
+    docs: List[RetrievedDoc] = []
+    for rank, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text") or item.get("document") or ""
+        if not isinstance(text, str) or not text.strip():
+            # A match with no text cannot be graded for relevance. Skip it
+            # rather than feeding the judge an empty document, but do not
+            # renumber the survivors - rank must stay the retriever's order.
+            continue
+        score = item.get("score")
+        docs.append(RetrievedDoc(
+            rank=rank,
+            id=str(item["id"]) if item.get("id") is not None else None,
+            text=text,
+            score=float(score) if isinstance(score, (int, float)) else None,
+        ))
+    return docs
+
+
+def _retrieval_from_event(event: Dict[str, Any]) -> Optional[Retrieval]:
+    """Build a Retrieval from a vector-store span, or None if it is not one."""
+    if str(event.get("type") or "").lower() not in _RETRIEVAL_TYPES:
+        return None
+    docs = _retrieval_docs(event)
+    if not docs:
+        # A mutation (upsert/delete) or an empty result set. Nothing to grade.
+        return None
+    query_block = event.get("query") if isinstance(event.get("query"), dict) else {}
+    return Retrieval(
+        query=_retrieval_query(event),
+        docs=docs,
+        integration=event.get("integration"),
+        target=_retrieval_target(event),
+        top_k=query_block.get("top_k") or query_block.get("k") or query_block.get("n_results"),
+    )
+
+
+def _retrieval_target(event: Dict[str, Any]) -> Optional[str]:
+    target = event.get("target")
+    if isinstance(target, str):
+        return target
+    if isinstance(target, dict):
+        for key in ("collection", "index", "name", "class_name"):
+            val = target.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return None
+
+
 # ── Fluiq envelope ───────────────────────────────────────────────────────────
 
 def from_fluiq(payload: Any) -> AgentRun:
@@ -315,6 +404,7 @@ def from_fluiq(payload: Any) -> AgentRun:
             parent_id=event.get("parent_id"),
             parent_ids=_parent_ids(event),
             tool_calls=_tool_calls_from_event(event),
+            retrieval=_retrieval_from_event(event),
         ))
 
     run.goal = _goal_from_events(events)
