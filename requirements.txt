@@ -1,6 +1,8 @@
-# Text judge calls (openai, anthropic, gemini, moonshot) go through polygate,
-# Fluiq's own unified LLM client — one wire shape plus key rotation + backoff.
-polygate>=0.2
+# Text judge calls go through polygate, Fluiq's own unified LLM client — one
+# wire shape plus key rotation + backoff. The pin is >=0.3 because judge.py
+# routes 21 providers: 0.2 shipped only four adapters, so an older resolve would
+# accept a Groq or Z.AI judge and then fail at call time with UnsupportedProvider.
+polygate>=0.3
 # The native provider SDKs below are retained only for the multimodal/vision
 # judge path, which polygate's text-only message shape can't express across all
 # providers (Gemini especially). If vision moves off the SDKs, drop these.

@@ -7,6 +7,7 @@ so evaluations never break because of this table.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -91,26 +92,48 @@ class PostgresClient:
         except Exception:
             logger.exception("[EVALUATOR][PG] seed failed; using default prompts")
 
-    async def fetch_custom_judge(self, organization_id: Any, slug: str) -> Optional[str]:
-        """Return the live template for an org's client-defined judge prompt, or None.
+    async def fetch_custom_scorer(
+        self, organization_id: Any, slug: str,
+    ) -> Optional[tuple[str, str, dict]]:
+        """Return ``(kind, template, config)`` for an org's scorer, or None.
 
-        Resolves a ``custom_judges`` slug from ``fluiq.eval()`` to the template saved
-        on the Prompts page (``kind = 'judge'``). Best-effort: returns None when the
-        pool is down or the slug doesn't resolve, so the metric is simply skipped.
+        Resolves a ``custom_judges`` slug from ``fluiq.eval()`` to what the customer
+        saved on the Prompts page. ``kind`` is ``'judge'`` (an LLM-as-judge prompt)
+        or ``'code'`` (a deterministic expression), and the caller routes on it —
+        the two are referenced identically by the client, because from the outside
+        both are just "a scorer with a threshold". ``config`` carries a judge's
+        choice set when it has one, and is ``{}`` otherwise.
+
+        Best-effort: returns None when the pool is down or the slug doesn't
+        resolve, so the metric is simply skipped.
         """
         if self._pool is None:
             return None
         try:
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT template FROM prompts "
-                    "WHERE org_id = $1::uuid AND slug = $2 AND kind = 'judge'",
+                    "SELECT kind, template, config FROM prompts "
+                    "WHERE org_id = $1::uuid AND slug = $2 AND kind IN ('judge', 'code')",
                     str(organization_id), slug,
                 )
-            return row["template"] if row else None
+            if row is None:
+                return None
+            config = row["config"]
+            if isinstance(config, str):
+                # The jsonb codec is not applied on every pool path.
+                try:
+                    config = json.loads(config)
+                except ValueError:
+                    config = {}
+            return (row["kind"], row["template"], config if isinstance(config, dict) else {})
         except Exception:
-            logger.exception("[EVALUATOR][PG] custom judge fetch failed slug=%s", slug)
+            logger.exception("[EVALUATOR][PG] custom scorer fetch failed slug=%s", slug)
             return None
+
+    async def fetch_custom_judge(self, organization_id: Any, slug: str) -> Optional[str]:
+        """Back-compat shim: the template only, and only for LLM-judge scorers."""
+        found = await self.fetch_custom_scorer(organization_id, slug)
+        return found[1] if found and found[0] == "judge" else None
 
     async def fetch_org_credentials(
         self, organization_id: Any,

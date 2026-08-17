@@ -266,15 +266,23 @@ def _build_judge(
         api_key=api_key,
         usage=usage,
     )
-    def _underlying(prompt: str, **_params) -> str:
+    def _underlying(prompt: str, choice_labels=None, **_params) -> str:
+        # `choice_labels` has to survive this hop: it is what pins a forced-choice
+        # judge's answer to an enum at the provider. Dropping it here would leave
+        # the feature working only when no cache and no BYOK key are configured —
+        # which is to say, never in production.
+        #
+        # Passed only when set, so a stub that replaces `_call_*` with a
+        # prompt-only function keeps working.
+        extra = {"choice_labels": choice_labels} if choice_labels else {}
         if judge.provider == "openai":
-            return judge._call_openai(prompt)
+            return judge._call_openai(prompt, **extra)
         if judge.provider == "anthropic":
-            return judge._call_anthropic(prompt)
+            return judge._call_anthropic(prompt, **extra)
         if judge.provider == "gemini":
-            return judge._call_gemini(prompt)
+            return judge._call_gemini(prompt, **extra)
         if judge.provider == "moonshot":
-            return judge._call_moonshot(prompt)
+            return judge._call_moonshot(prompt, **extra)
         raise RuntimeError(f"Unsupported judge provider: {judge.provider}")
 
     call = _underlying
@@ -302,7 +310,7 @@ def _build_judge(
 
         def _reporting(prompt: str, **params) -> str:
             try:
-                return inner(prompt, **params)
+                return inner(prompt, **params)  # params carries choice_labels
             except Exception as exc:  # noqa: BLE001 - re-raised below
                 if is_auth_error(exc):
                     creds.note_auth_failure(
@@ -315,7 +323,11 @@ def _build_judge(
     if call is _underlying:
         return judge  # nothing wrapped — leave __call__ on the direct path
 
-    judge._judge_fn = lambda prompt: call(prompt, temperature=judge.temperature)
+    # **kw forwards choice_labels for forced-choice judging; the cache keys on it
+    # too, so a "Y/N" verdict can't be served for a differently-worded option set.
+    judge._judge_fn = lambda prompt, **kw: call(
+        prompt, temperature=judge.temperature, **kw,
+    )
     return judge
 
 
@@ -787,6 +799,7 @@ async def auto_llm_eval(message: Dict[str, Any]) -> None:
         question=question,
         answer=answer,
         context=reference,
+        example_metadata=eval_config.get("example_metadata"),
     )
 
 
@@ -801,52 +814,76 @@ async def _run_custom_judges(
     answer: str,
     context: str,
     root_trace_id: Optional[str] = None,
+    example_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Score an answer with each client-defined judge referenced by slug.
+    """Score an answer with each client-defined scorer referenced by slug.
 
-    Resolves the slug to its saved judge template (org-scoped, ``kind='judge'``)
-    and persists one eval row per scorer. Shared by the single-turn and agentic
-    paths so a scorer behaves identically on both.
+    A scorer is either an LLM-as-judge prompt (``kind='judge'``) or a
+    deterministic expression (``kind='code'``); the client references both the
+    same way, and this routes on what was actually saved. Persists one eval row
+    per scorer, and is shared by the single-turn and agentic paths so a scorer
+    behaves identically on both.
 
-    Best-effort per judge: a missing template, an unreachable Postgres, or a
-    judge error skips that scorer rather than failing the whole evaluation.
+    Best-effort per scorer: a missing template, an unreachable Postgres, or an
+    error inside one scorer skips it rather than failing the whole evaluation.
     """
     if not custom_judges:
         return
     from db.postgres import postgres_client
+    from jobs.helper.code_scorer_evaluator import CodeScorerEvaluator
     from jobs.helper.custom_judge import CustomJudgeEvaluator
 
+    from jobs.helper.choice_scores import parse_choices
+
     for slug, threshold in custom_judges.items():
-        template = await postgres_client.fetch_custom_judge(organization_id, slug)
-        if not template:
+        found = await postgres_client.fetch_custom_scorer(organization_id, slug)
+        if not found or not found[1]:
             logger.info(
-                "[EVALUATOR] custom judge %r unavailable for org=%s; skipping",
+                "[EVALUATOR] custom scorer %r unavailable for org=%s; skipping",
                 slug, organization_id,
             )
             continue
+        kind, template, scorer_config = found
         try:
-            ev = CustomJudgeEvaluator(
-                judge=judge, template=template, name=slug,
-                threshold=float(threshold or 0.0),
-            )
-            result = await asyncio.to_thread(
-                ev.evaluate, question=question, answer=answer, context=context,
-            )
+            if kind == "code":
+                ev: Any = CodeScorerEvaluator(
+                    source=template, name=slug, threshold=float(threshold or 0.0),
+                )
+                result = await asyncio.to_thread(
+                    ev.evaluate,
+                    question=question, answer=answer,
+                    expected=context, metadata=example_metadata or {},
+                )
+            else:
+                # A malformed choice set must not silently become a free-score
+                # judge: that would change what the scorer means without saying so.
+                choices = parse_choices((scorer_config or {}).get("choices"))
+                ev = CustomJudgeEvaluator(
+                    judge=judge, template=template, name=slug,
+                    threshold=float(threshold or 0.0),
+                    choices=choices,
+                )
+                result = await asyncio.to_thread(
+                    ev.evaluate, question=question, answer=answer, context=context,
+                )
             await _persist_eval_result(
                 organization_id, api_key_prefix, trace_id,
                 evaluator="fluiq.eval",
                 metric=slug,
                 result=result,
-                judge=judge,
+                # A code scorer makes no model call, so attributing one to a
+                # judge model would misreport both cost and provenance.
+                judge=None if kind == "code" else judge,
                 root_trace_id=root_trace_id,
             )
             logger.info(
-                "[EVALUATOR] custom_judge %s org=%s trace_id=%s score=%.3f threshold=%.3f",
-                slug, organization_id, trace_id, result.score, float(threshold or 0.0),
+                "[EVALUATOR] custom_scorer(%s) %s org=%s trace_id=%s score=%.3f threshold=%.3f",
+                kind, slug, organization_id, trace_id, result.score, float(threshold or 0.0),
             )
         except Exception:
             logger.exception(
-                "[EVALUATOR] custom judge failed slug=%s trace_id=%s", slug, trace_id,
+                "[EVALUATOR] custom scorer failed kind=%s slug=%s trace_id=%s",
+                kind, slug, trace_id,
             )
 
 
@@ -990,6 +1027,7 @@ async def agent_evaluate(message: Dict[str, Any]) -> None:
         answer=run.final_output or "",
         context=run.goal or "",
         root_trace_id=root_trace_id,
+        example_metadata=(message.get("eval_config") or {}).get("example_metadata"),
     )
 
     logger.info(
@@ -1212,7 +1250,7 @@ async def _persist_eval_result(
     evaluator: str,
     metric: str,
     result: Any,
-    judge: LLMJudge,
+    judge: Optional[LLMJudge],
     root_trace_id: Optional[str] = None,
     details_override: Optional[Dict[str, Any]] = None,
     layer: str = "",
@@ -1220,19 +1258,28 @@ async def _persist_eval_result(
     run_score: float = 0.0,
     run_passed: bool = True,
 ) -> None:
+    """Persist one metric row and fan it out to the live trace stream.
+
+    ``judge`` is None for scorers that make no model call (a deterministic code
+    scorer). Those rows carry no judge model and no token spend, so a report that
+    sums judge usage stays truthful instead of attributing a free scorer's result
+    to whichever model happened to be configured.
+    """
     details = details_override if details_override is not None else result.model_dump(mode="json")
     # Prompt provenance is attached to the evaluator's own details; lift it to
     # the top level of the CH details column so the dashboard reads it flat.
     nested = details.get("details")
     if "judge_prompts" not in details and isinstance(nested, dict) and nested.get("judge_prompts"):
         details["judge_prompts"] = nested.pop("judge_prompts")
-    details.setdefault("judge_provider", judge.provider)
+    if judge is not None:
+        details.setdefault("judge_provider", judge.provider)
     score = float(result.score)
     # Drained, not read: one message can persist several metric rows, and the
     # judge spend belongs to the message as a whole (a jury's calls are not
     # divisible per metric). The first row carries the totals and later rows
     # carry zeros, so SUM over rows is the true spend rather than a multiple.
-    judge_in, judge_out, judge_calls = judge.usage.drain()
+    judge_in, judge_out, judge_calls = judge.usage.drain() if judge is not None else (0, 0, 0)
+    judge_model = judge.model if judge is not None else ""
     record = {
         "organization_id": organization_id,
         "api_key_prefix":  api_key_prefix,
@@ -1241,7 +1288,7 @@ async def _persist_eval_result(
         "evaluator":       evaluator,
         "metric":          metric,
         "score":           score,
-        "judge_model":     judge.model,
+        "judge_model":     judge_model,
         "judge_input_tokens":  judge_in,
         "judge_output_tokens": judge_out,
         "judge_calls":         judge_calls,
@@ -1264,7 +1311,7 @@ async def _persist_eval_result(
             "metric":      metric,
             "score":       score,
             "evaluator":   evaluator,
-            "judge_model": judge.model,
+            "judge_model": judge_model,
             "details":     details,
         },
     }

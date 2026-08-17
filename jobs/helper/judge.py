@@ -12,14 +12,48 @@ from jobs.helper.base import _parse_json_object
 
 JudgeFn = Callable[[str], str]
 
-PROVIDERS = ("openai", "anthropic", "gemini", "moonshot")
+# Every provider polygate can route a judge call to. Kept in step with
+# fluiq-api/shared/providers.py — the two deployables can't share code, and a
+# provider a customer can store a key for but the judge refuses to route is the
+# failure this list exists to prevent.
+PROVIDERS = (
+    "openai", "anthropic", "gemini", "mistral", "groq", "together",
+    "fireworks", "perplexity", "xai", "cerebras", "deepseek", "moonshot",
+    "zai",
+    # Gateways. Fixed host, OpenAI wire format, someone else's models behind
+    # it — so a model id here is usually "vendor/model".
+    "openrouter", "vercel", "baseten", "deepinfra", "sambanova",
+    "nebius", "novita", "hyperbolic",
+    # The clouds (bedrock/azure/vertex/databricks/cloudflare) are deliberately
+    # absent: polygate can reach them, but each needs an endpoint or region
+    # stored beside the key, which provider keys cannot yet carry. Kept in step
+    # with ROUTABLE_PROVIDERS in fluiq-api/shared/providers.py.
+)
 
 # Every judge provider is routed through polygate (Fluiq's own unified LLM
 # client) rather than each vendor's SDK, so the worker speaks one request/
 # response shape and gains key rotation + backoff for free. The vision path
 # stays on native SDKs — polygate's unified string-content messages can't
 # express image blocks across all three providers (Gemini in particular).
-_POLYGATE_TEXT_PROVIDERS = ("openai", "anthropic", "gemini", "moonshot")
+_POLYGATE_TEXT_PROVIDERS = PROVIDERS
+
+# Providers whose chat API accepts ``response_format``. Anthropic has no JSON
+# mode on this path and relies on the system prompt plus ``_parse_json_object``.
+_JSON_MODE_PROVIDERS = frozenset({
+    "openai", "moonshot", "groq", "together", "fireworks",
+    "mistral", "xai", "cerebras", "deepseek", "zai",
+    # Gateways inherit whatever the upstream model supports. JSON mode is
+    # near-universal on the models these serve, and a provider that ignores the
+    # field returns prose that _parse_json_object still recovers.
+    "openrouter", "vercel", "baseten", "deepinfra", "sambanova",
+    "nebius", "novita", "hyperbolic",
+})
+
+# The narrower set that honours strict ``json_schema`` with an enum — real
+# constrained decoding. The others get plain JSON mode; a schema they reject
+# would fail the call outright, which is worse than a slightly looser answer the
+# caller validates anyway.
+_JSON_SCHEMA_PROVIDERS = frozenset({"openai", "moonshot", "fireworks", "xai"})
 
 # Judge calls are idempotent, so transient provider failures (429 / 5xx /
 # Anthropic's 529 overload) are safe to retry. polygate rotates across the key
@@ -77,11 +111,18 @@ class JudgeUsage:
             self.input_tokens = self.output_tokens = self.calls = 0
             return totals
 
+# The model used when a provider is chosen without one. Cheap-and-fast per
+# provider: a judge runs on every scored trace, so the default has to be the one
+# nobody regrets leaving in place.
 DEFAULT_MODELS: Dict[str, str] = {
-    "openai":    "gpt-4o-mini",
-    "anthropic": "claude-haiku-4-5-20251001",
-    "gemini":    "gemini-2.5-flash",
-    "moonshot":  "kimi-k2-0711-preview",
+    "openai":     "gpt-4o-mini",
+    "anthropic":  "claude-haiku-4-5-20251001",
+    "gemini":     "gemini-2.5-flash",
+    "mistral":    "mistral-small-latest",
+    "groq":       "llama-3.3-70b-versatile",
+    "xai":        "grok-3-mini",
+    "deepseek":   "deepseek-chat",
+    "moonshot":   "kimi-k2-0711-preview",
 }
 
 def _usage_openai(resp: Any) -> tuple[int, int]:
@@ -113,6 +154,44 @@ def _usage_gemini(resp: Any) -> tuple[int, int]:
     )
 
 
+# ── Forced-choice response schemas ───────────────────────────────────────────
+#
+# The shape both schemas describe: {"choice": <one of the labels>, "reason": str}.
+# Providers that support constrained decoding get the enum, which makes an
+# off-menu answer impossible rather than merely unlikely.
+
+def _openai_choice_schema(labels: list[str]) -> Dict[str, Any]:
+    """OpenAI/Moonshot strict JSON-schema mode."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "judge_choice",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "choice": {"type": "string", "enum": list(labels)},
+                    "reason": {"type": "string"},
+                },
+                "required": ["choice", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _gemini_choice_schema(labels: list[str]) -> Dict[str, Any]:
+    """Gemini response schema (OpenAPI subset — no additionalProperties)."""
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "choice": {"type": "STRING", "enum": list(labels)},
+            "reason": {"type": "STRING"},
+        },
+        "required": ["choice", "reason"],
+    }
+
+
 class LLMJudge:
     """LLM-as-judge with pluggable providers (openai, anthropic, gemini, moonshot)."""
 
@@ -130,7 +209,16 @@ class LLMJudge:
                 f"Unsupported judge provider: {provider!r}. Use one of: {PROVIDERS}"
             )
         self.provider = provider
-        self.model = model or DEFAULT_MODELS[provider]
+        resolved = model or DEFAULT_MODELS.get(provider)
+        if not resolved:
+            # Some providers host so many third-party models that no default is
+            # defensible (Together, Fireworks, Cerebras). Saying so beats a
+            # KeyError, and beats picking one on the customer's behalf.
+            raise ValueError(
+                f"Judge provider {provider!r} has no default model; pass one "
+                f"explicitly (e.g. judge='{provider}:<model>')."
+            )
+        self.model = resolved
         self.temperature = temperature
         self._judge_fn = judge_fn
         # Optional test/override hook for the multimodal path: (prompt, media) -> str.
@@ -164,6 +252,33 @@ class LLMJudge:
 
     def judge_json(self, prompt: str) -> Dict[str, Any]:
         return _parse_json_object(self(prompt))
+
+    def judge_choice(self, prompt: str, labels: list[str]) -> Dict[str, Any]:
+        """Make the judge pick one of ``labels`` rather than invent a number.
+
+        Choosing between written options is a classification task a model does
+        reliably; emitting a calibrated float is not, and free floats cluster
+        around whatever threshold the author set. The caller maps the chosen
+        label to a score through its own table, so the number never comes from
+        the model at all.
+
+        Where the provider can constrain decoding to an enum (OpenAI/Moonshot
+        JSON-schema mode, Gemini response schemas) it is constrained; elsewhere
+        the prompt states the options and the caller validates the answer against
+        them. Both paths return ``{"choice": str, "reason": str}`` — a choice
+        outside the set is left as-is for the caller to reject, because silently
+        coercing it would invent a grade.
+        """
+        if self._judge_fn is not None:
+            # The wrapper chain (cache, BYOK error reporting) forwards kwargs to
+            # the provider call, so the enum survives it. A test hook that takes
+            # only a prompt still works: the options are in the prompt text, and
+            # the caller validates the answer either way.
+            try:
+                return _parse_json_object(self._judge_fn(prompt, choice_labels=labels))
+            except TypeError:
+                return _parse_json_object(self._judge_fn(prompt))
+        return _parse_json_object(self._chat_via_polygate(prompt, choice_labels=labels))
 
     # ── multimodal (vision) judging ──────────────────────────────────────────
     def supports_vision(self) -> bool:
@@ -256,19 +371,26 @@ class LLMJudge:
     # These keep their per-provider names because run.py's BYOK wrapper calls
     # them directly, but each just defers to the unified polygate path — the
     # provider is already fixed on the instance, so there's nothing to branch on.
-    def _call_openai(self, prompt: str) -> str:
-        return self._chat_via_polygate(prompt)
+    # Per-provider seams. They all reach the same transport, but they are the
+    # documented place to stub a provider, so the dispatch keeps going through
+    # them. ``choice_labels`` is keyword-only with a default so a stub that takes
+    # only a prompt still satisfies the signature.
 
-    def _call_moonshot(self, prompt: str) -> str:
-        return self._chat_via_polygate(prompt)
+    def _call_openai(self, prompt: str, *, choice_labels: Optional[list] = None) -> str:
+        return self._chat_via_polygate(prompt, choice_labels=choice_labels)
 
-    def _call_anthropic(self, prompt: str) -> str:
-        return self._chat_via_polygate(prompt)
+    def _call_moonshot(self, prompt: str, *, choice_labels: Optional[list] = None) -> str:
+        return self._chat_via_polygate(prompt, choice_labels=choice_labels)
 
-    def _call_gemini(self, prompt: str) -> str:
-        return self._chat_via_polygate(prompt)
+    def _call_anthropic(self, prompt: str, *, choice_labels: Optional[list] = None) -> str:
+        return self._chat_via_polygate(prompt, choice_labels=choice_labels)
 
-    def _chat_via_polygate(self, prompt: str) -> str:
+    def _call_gemini(self, prompt: str, *, choice_labels: Optional[list] = None) -> str:
+        return self._chat_via_polygate(prompt, choice_labels=choice_labels)
+
+    def _chat_via_polygate(
+        self, prompt: str, choice_labels: Optional[list[str]] = None,
+    ) -> str:
         """One request/response shape for every text provider, via polygate.
 
         The system prompt goes in as a ``system`` message; polygate maps it to
@@ -277,6 +399,10 @@ class LLMJudge:
         JSON mode is requested where the provider supports it; Anthropic has no
         JSON mode, so it relies on the system prompt plus ``_parse_json_object``
         downstream, exactly as the SDK path did.
+
+        ``choice_labels`` additionally pins the answer to an enum where the
+        provider can enforce one, so the model cannot return a label that was
+        never offered.
         """
         try:
             from polygate import chat as polygate_chat
@@ -304,8 +430,16 @@ class LLMJudge:
         if not api_key and provider == "gemini":
             api_key = os.getenv("GOOGLE_API_KEY")
 
-        if provider in ("openai", "moonshot"):
-            extra["response_format"] = {"type": "json_object"}
+        if provider in _JSON_MODE_PROVIDERS:
+            # Strict json_schema is only honoured by a subset; the rest accept
+            # json_object and are held to the option set by the prompt plus the
+            # caller's validation. Sending a schema they ignore is harmless, but
+            # sending one they *reject* would fail the whole call, so the two
+            # tiers are kept apart.
+            if choice_labels and provider in _JSON_SCHEMA_PROVIDERS:
+                extra["response_format"] = _openai_choice_schema(choice_labels)
+            else:
+                extra["response_format"] = {"type": "json_object"}
         elif provider == "gemini":
             # polygate overwrites the whole generationConfig with this kwarg, so
             # it has to carry the temperature too; a separate temperature= would
@@ -314,9 +448,15 @@ class LLMJudge:
                 "temperature": self.temperature,
                 "responseMimeType": "application/json",
             }
+            if choice_labels:
+                extra["generationConfig"]["responseSchema"] = _gemini_choice_schema(
+                    choice_labels
+                )
             temperature = None
         elif provider == "anthropic":
             max_tokens = 1024  # Anthropic requires an explicit max_tokens.
+            # Anthropic has no JSON/enum mode on this path, so its answer is
+            # constrained by the prompt and validated by the caller instead.
 
         resp = polygate_chat(
             provider=provider,
