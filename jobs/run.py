@@ -815,6 +815,7 @@ async def _run_custom_judges(
     context: str,
     root_trace_id: Optional[str] = None,
     example_metadata: Optional[Dict[str, Any]] = None,
+    run: Any = None,
 ) -> None:
     """Score an answer with each client-defined scorer referenced by slug.
 
@@ -823,6 +824,14 @@ async def _run_custom_judges(
     same way, and this routes on what was actually saved. Persists one eval row
     per scorer, and is shared by the single-turn and agentic paths so a scorer
     behaves identically on both.
+
+    A judge saved with a ``target`` other than 'output' grades a different part
+    of the run — its tool calls, its retrievals, its trajectory, its hand-offs —
+    so it is handed that evidence instead of the final answer. Without this a
+    prompt asking "did it pick the right tool?" was shown only the answer, in
+    which the tool calls do not appear: it was scoring something it could not
+    see. Targets need ``run``, so on the single-turn path (no normalized run)
+    they fall back to grading the answer.
 
     Best-effort per scorer: a missing template, an unreachable Postgres, or an
     error inside one scorer skips it rather than failing the whole evaluation.
@@ -863,8 +872,18 @@ async def _run_custom_judges(
                     threshold=float(threshold or 0.0),
                     choices=choices,
                 )
+                target = str((scorer_config or {}).get("target") or "output").lower()
+                graded, evidence_ctx = answer, context
+                if target != "output" and run is not None:
+                    from jobs.agentic.evidence import render as render_evidence
+                    evidence = render_evidence(run, target)
+                    # Both placeholders get the evidence: templates in the wild
+                    # reference {{answer}} (it is the one a judge prompt must
+                    # contain), while {{context}} reads more naturally for a
+                    # retrieval prompt. Neither should be the empty string.
+                    graded, evidence_ctx = evidence, evidence
                 result = await asyncio.to_thread(
-                    ev.evaluate, question=question, answer=answer, context=context,
+                    ev.evaluate, question=question, answer=graded, context=evidence_ctx,
                 )
             await _persist_eval_result(
                 organization_id, api_key_prefix, trace_id,
@@ -1028,6 +1047,7 @@ async def agent_evaluate(message: Dict[str, Any]) -> None:
         context=run.goal or "",
         root_trace_id=root_trace_id,
         example_metadata=(message.get("eval_config") or {}).get("example_metadata"),
+        run=run,
     )
 
     logger.info(

@@ -40,6 +40,26 @@ def kafka_auth_kwargs() -> dict:
 KAFKA_EVAL_TOPIC = os.getenv("KAFKA_EVAL_TOPIC")
 KAFKA_EVAL_GROUP_ID = os.getenv("KAFKA_EVAL_GROUP_ID")
 
+# How long one message may take before Kafka assumes this consumer is dead and
+# hands its partition to someone else.
+#
+# aiokafka defaults to 5 minutes. One eval message can legitimately exceed that:
+# a deep agentic run convenes a multi-model panel and judges several layers, all
+# sequentially on a single executor thread. When it does, the broker evicts the
+# member mid-message, the uncommitted offset is redelivered, and the whole run
+# is judged a second time — duplicate rows and a duplicate provider bill.
+#
+# 15 minutes is chosen to be longer than any plausible single message rather
+# than as a guess at the average. The cost of setting it too high is only that a
+# genuinely wedged worker takes longer to be noticed; the cost of too low is
+# paying twice for every slow evaluation.
+KAFKA_MAX_POLL_INTERVAL_MS = int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", str(15 * 60 * 1000)))
+# Liveness is carried by the background heartbeat, which is unaffected by how
+# long a message takes — so this stays short and detects a truly dead process
+# quickly, independent of the poll interval above.
+KAFKA_SESSION_TIMEOUT_MS = int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "45000"))
+KAFKA_HEARTBEAT_INTERVAL_MS = int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "3000"))
+
 JUDGE_PROVIDER = os.getenv("EVAL_JUDGE_PROVIDER")
 JUDGE_MODEL = os.getenv("EVAL_JUDGE_MODEL")
 JUDGE_THRESHOLD = float(os.getenv("EVAL_JUDGE_THRESHOLD"))

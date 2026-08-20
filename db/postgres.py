@@ -18,6 +18,37 @@ import config
 
 logger = logging.getLogger(__name__)
 
+#: A jsonb value is decoded at most this many times. Two is what the API's
+#: rows actually need; the bound exists so a pathological value can't loop.
+_MAX_JSON_DECODES = 3
+
+
+def _decode_jsonb(raw: Any) -> dict:
+    """A jsonb column as a dict, however many times it happens to be encoded.
+
+    The API writes these columns with an explicit ``json.dumps`` *and* through
+    an asyncpg pool whose jsonb codec dumps again, so what lands in Postgres is
+    a JSON string holding JSON rather than a JSON object. Decoding once leaves a
+    ``str``, which the previous code discarded as "not a dict" — silently
+    returning ``{}``. That cost a custom judge its choice set (turning a
+    fixed-label judge into a free-score one without saying so) and, later, its
+    scoring target.
+
+    Decoding in a loop handles both the double-encoded rows written so far and
+    correctly-encoded ones written after the writer is fixed.
+    """
+    value = raw
+    for _ in range(_MAX_JSON_DECODES):
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            return {}
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
 
 class PostgresClient:
     def __init__(self, dsn: Optional[str] = None) -> None:
@@ -118,14 +149,8 @@ class PostgresClient:
                 )
             if row is None:
                 return None
-            config = row["config"]
-            if isinstance(config, str):
-                # The jsonb codec is not applied on every pool path.
-                try:
-                    config = json.loads(config)
-                except ValueError:
-                    config = {}
-            return (row["kind"], row["template"], config if isinstance(config, dict) else {})
+            config = _decode_jsonb(row["config"])
+            return (row["kind"], row["template"], config)
         except Exception:
             logger.exception("[EVALUATOR][PG] custom scorer fetch failed slug=%s", slug)
             return None

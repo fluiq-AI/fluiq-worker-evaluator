@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import config
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
@@ -147,6 +148,42 @@ async def dispatch(message: dict[str, Any]) -> None:
         judge_prompts.set_run_overrides(None)
 
 
+#: Offsets already evaluated by this process, newest last. Bounded because it
+#: only has to outlive a rebalance, not the process.
+_PROCESSED_LIMIT = 4096
+_processed: "OrderedDict[tuple[str, int, int], None]" = OrderedDict()
+
+
+def _already_processed(topic: str, partition: int, offset: int) -> bool:
+    """True when this exact message has already been evaluated *successfully*.
+
+    Kafka delivery is at-least-once: a rebalance redelivers whatever was not
+    committed, and a redelivered eval message is not a second opinion — it is
+    the same judgement, billed and stored twice. Offsets identify a message
+    exactly, so this cannot suppress a genuine second evaluation of the same
+    trace (that arrives as its own message at its own offset).
+
+    In-process only, deliberately. It covers the rebalance case, which is the
+    one that happens under normal operation. A redelivery after a crash is rare,
+    and there the honest thing is to evaluate again — the process died without
+    ever recording whether it finished.
+    """
+    return (topic, partition, offset) in _processed
+
+
+def _mark_processed(topic: str, partition: int, offset: int) -> None:
+    """Record a message as done.
+
+    Called only after a message is finished with — never on receipt. The
+    transient-error path deliberately seeks back to re-consume the *same*
+    offset, so marking on arrival would turn a retry into a silent skip and
+    lose the evaluation the retry existed to save.
+    """
+    _processed[(topic, partition, offset)] = None
+    if len(_processed) > _PROCESSED_LIMIT:
+        _processed.popitem(last=False)
+
+
 async def consume() -> None:
 
     async def _consumer_attempt() -> AIOKafkaConsumer:
@@ -161,6 +198,11 @@ async def consume() -> None:
             enable_auto_commit=False,
             auto_offset_reset="earliest",
             max_partition_fetch_bytes=config.KAFKA_MAX_FETCH_BYTES,
+            # A long evaluation must not look like a dead consumer — see the
+            # comment on KAFKA_MAX_POLL_INTERVAL_MS.
+            max_poll_interval_ms=config.KAFKA_MAX_POLL_INTERVAL_MS,
+            session_timeout_ms=config.KAFKA_SESSION_TIMEOUT_MS,
+            heartbeat_interval_ms=config.KAFKA_HEARTBEAT_INTERVAL_MS,
             **config.kafka_auth_kwargs(),
         )
         try:
@@ -204,8 +246,19 @@ async def consume() -> None:
         backoff = _RETRY_INITIAL_S
         retries = 0
         async for msg in consumer:
+            if _already_processed(msg.topic, msg.partition, msg.offset):
+                # Logged rather than passed over silently: a burst of these is
+                # the signal that messages are outrunning max_poll_interval_ms.
+                logger.warning(
+                    "[EVALUATOR] offset=%s partition=%s already evaluated "
+                    "(redelivered after a rebalance) — committing without re-judging",
+                    msg.offset, msg.partition,
+                )
+                await consumer.commit()
+                continue
             try:
                 await dispatch(msg.value)
+                _mark_processed(msg.topic, msg.partition, msg.offset)
                 await consumer.commit()
                 backoff, retries = _RETRY_INITIAL_S, 0
             except Exception as exc:
@@ -233,6 +286,7 @@ async def consume() -> None:
                         "[EVALUATOR] Failed to process message offset=%s partition=%s — skipping",
                         msg.offset, msg.partition,
                     )
+                    _mark_processed(msg.topic, msg.partition, msg.offset)
                     try:
                         await consumer.commit()
                     except Exception:
